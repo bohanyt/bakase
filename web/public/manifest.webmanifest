@@ -1,0 +1,22 @@
+{
+    "background_color":  "#ffffff",
+    "short_name":  "Bakase",
+    "icons":  [
+                  {
+                      "type":  "image/png",
+                      "sizes":  "192x192",
+                      "src":  "/brand/app-icon-192.png"
+                  },
+                  {
+                      "type":  "image/png",
+                      "sizes":  "512x512",
+                      "src":  "/brand/mascot.png"
+                  }
+              ],
+    "lang":  "id",
+    "theme_color":  "#ffffff",
+    "display":  "standalone",
+    "name":  "Bakase",
+    "scope":  "/",
+    "start_url":  "/"
+}

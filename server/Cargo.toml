@@ -1,0 +1,66 @@
+[package]
+name = "rag-hub-server"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+cuda = ["ort/cuda"]
+
+[dependencies]
+anyhow = "1.0.104"
+argon2 = "0.6.0"
+async-openai = { version = "0.43.0", features = ["chat-completion", "responses", "byot"] }
+async-stream = "0.3.6"
+axum = "0.8.9"
+axum-extra = { version = "0.12.6", features = ["cookie"] }
+base64 = "0.23.1"
+# Sel lampiran Excel untuk read_xlsx/edit_xlsx; versi yang sama sudah dipakai xberg.
+calamine = { version = "0.36.1", features = ["dates"] }
+# Preflight BIFF dalam kontainer OLE; pakai versi yang sudah ada di lockfile.
+cfb = "0.15"
+# Cek isi zip lampiran sebelum dibaca; versi dan fitur sama dengan yang dipakai calamine.
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+docx-rs = "0.4.22"
+futures = "0.3.34"
+hex = "0.4.3"
+image = { version = "=0.25.10", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "tga", "tiff", "webp"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "api-18", "ndarray", "load-dynamic"] }
+rand = "0.10.4"
+regex = "1.13"
+# Letak kode dan link di jawaban, untuk nomor sitasi; versi yang sama sudah ikut lewat xberg.
+pulldown-cmark = { version = "0.13.6", default-features = false }
+unicase = "2.10"
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.3"
+quick-xml = "0.42"
+# Hanya untuk kurs USD-IDR harian (fx.rs); TLS dan versinya sama dengan async-openai.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+rpassword = "7.5.5"
+rusqlite = { version = "0.43.0", features = ["bundled", "functions"] }
+rust_xlsxwriter = "0.102.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tantivy = "0.27.0"
+time = "0.3"
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2.1"
+tower-http = { version = "0.7.1", features = ["fs", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+xberg = { version = "=1.3.10", default-features = false, features = ["pdf", "office", "excel", "tokio-runtime"] }
+xberg-native-pdf = "=1.3.10"
+
+# API key Azure di Windows Credential Manager (`set-azure-key`), dan service Windows
+# (`service install`): windows-service untuk SCM, windows-sys untuk hak "Log on as a service".
+[target.'cfg(windows)'.dependencies]
+keyring-core = "1.0.1"
+windows-native-keyring-store = "1.1.0"
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authentication_Identity", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tokio = { version = "1.54.1", features = ["test-util"] }
+tower = { version = "0.5.3", features = ["util"] }

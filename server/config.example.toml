@@ -1,0 +1,67 @@
+# Salin ke config.toml lalu sesuaikan. API key jangan ditulis di sini:
+# isi lewat variabel lingkungan APP_AZURE_API_KEY.
+
+bind = "127.0.0.1:8100"
+web_dir = "../web/dist"
+# Database dan data runtime. Tidak masuk git.
+data_dir = "../data"
+
+[azure]
+endpoint = "https://NAMA-RESOURCE.openai.azure.com"
+deployment = "vision"
+api_version = "2024-10-21"
+context_tokens = 128000
+
+[auth]
+email_domain = "example.com"
+session_hours = 24
+# Aktifkan saat aplikasi diakses lewat HTTPS.
+secure_cookie = false
+# Pilihan departemen saat daftar dan saat admin menyetujui.
+departments = ["Umum", "Operasional", "Review"]
+# ID extension Edge Bakase yang boleh menampilkan Bakase di panel samping (32 huruf a-p,
+# lihat edge://extensions). Kosong: Bakase tidak bisa dipasang di iframe mana pun.
+# extension_ids = ["abcdefghijklmnopabcdefghijklmnop"]
+
+# Tombol "Ada masalah? Hubungi IT" membuka WhatsApp ke nomor ini (angka dengan kode negara).
+# [support]
+# whatsapp = "6281234567890"
+
+# Tarif untuk tab Admin > Pemakaian, USD per 1 juta token. Bawaannya contoh tarif;
+# ubah kalau deployment memakai model lain. Kurs USD-IDR diambil sehari sekali dari fx_url
+# (Frankfurter, kurs referensi ECB); kosongkan fx_url untuk mematikan.
+# [pricing]
+# input_usd = 0.10
+# cached_input_usd = 0.01
+# output_usd = 0.50
+# fx_url = "https://api.frankfurter.dev/v1/latest?base=USD&symbols=IDR"
+# fallback_usd_idr = 18000
+
+# Satu pertanyaan cepat tanpa login di halaman masuk. Tanpa dokumen, tanpa file, tidak
+# disimpan. Setiap pertanyaan memakai kuota Azure, jadi dibatasi per perangkat dan total.
+# [guest]
+# enabled = true
+# per_device_per_hour = 3
+# total_per_hour = 60
+
+# Pencarian gabungan di chat. Aktif saat bagian ini diisi.
+# [makna]
+# model = 'D:\App\models\model-pilihan'
+# ort_dylib = 'D:\App\onnxruntime\onnxruntime.dll' # opsional, bawaan ORT_DYLIB_PATH
+# threads = 2
+# gpu = false
+
+# Indeks gambar sumber diisi terpisah lewat embed-gambar setelah ingest teks.
+# [gambar]
+# model = 'D:\App\models\embeddinggemma-2\onnx'
+# ort_dylib = 'D:\App\gpu\bin\onnxruntime.dll' # opsional, bawaan ORT_DYLIB_PATH
+
+# Folder dokumen untuk pencarian. Setelah mengubah bagian ini, jalankan
+# `rag-hub-server ingest`. Semua file di satu folder memakai hak akses yang sama:
+#   { type = "umum" }                                 semua user aktif
+#   { type = "departemen", departments = ["Review"] }     departemen tertentu (dan admin)
+#   { type = "admin" }                                hanya admin
+# [[sources]]
+# name = "Review"
+# path = 'D:\Dokumen\Review'
+# visibility = { type = "departemen", departments = ["Review"] }

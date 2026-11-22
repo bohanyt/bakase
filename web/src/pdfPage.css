@@ -1,0 +1,44 @@
+/* PDF.js TextLayer positions text with these properties relative to its viewport. */
+.pdf-text-layer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  line-height: 1;
+  letter-spacing: normal;
+  word-spacing: normal;
+  color-scheme: only light;
+  text-size-adjust: none;
+  mix-blend-mode: multiply;
+  transform-origin: 0 0;
+  --min-font-size: 1;
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+}
+
+.pdf-text-layer[data-main-rotation="90"] { transform: rotate(90deg) translateY(-100%); }
+.pdf-text-layer[data-main-rotation="180"] { transform: rotate(180deg) translate(-100%, -100%); }
+.pdf-text-layer[data-main-rotation="270"] { transform: rotate(270deg) translateX(-100%); }
+
+.pdf-text-layer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0 0;
+  user-select: text;
+}
+
+.pdf-text-layer span {
+  font-size: calc(var(--total-scale-factor) * var(--min-font-size) * var(--font-height));
+  transform: rotate(var(--rotate, 0deg)) scaleX(var(--scale-x, 1)) scale(calc(1 / var(--min-font-size)));
+}
+
+.pdf-text-layer ::selection {
+  color: transparent;
+  background: color-mix(in srgb, AccentColor 35%, transparent);
+}
+
+.pdf-text-layer ::highlight(pdf-citation) {
+  color: transparent;
+  background: color-mix(in srgb, var(--preview-paper-mark) 65%, transparent);
+}

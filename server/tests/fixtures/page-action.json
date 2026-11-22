@@ -1,0 +1,16 @@
+{
+  "commands": [
+    {"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","remaining_ms":12000,"action":"sorot","ref":"f14e1000001"},
+    {"id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","remaining_ms":10000,"action":"gulir","ref":null,"direction":"down"},
+    {"id":"cccccccccccccccccccccccccccccccc","remaining_ms":7500,"action":"gulir","ref":"e2","direction":"up"},
+    {"id":"dddddddddddddddddddddddddddddddd","remaining_ms":0,"action":"gulir","ref":"f14e3","direction":"to"}
+  ],
+  "replies": [
+    {"status":"highlighted"},
+    {"status":"scrolled","text":"Alamat: https://contoh.test/grid\nDibaca: 2026-11-21T01:00:00.000Z\n\nbaris 21","moved":true},
+    {"status":"stale_ref"},
+    {"status":"unavailable"},
+    {"status":"failed"},
+    {"status":"timeout"}
+  ]
+}

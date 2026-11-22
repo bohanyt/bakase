@@ -1,0 +1,33 @@
+# Rust
+server/target/
+server/target-deploy/
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# Konfigurasi lokal dan rahasia
+config.toml
+server/config.toml
+.env
+*.local
+
+# Data runtime dan file data kantor. Data kantor hanya boleh ada di data/.
+data/
+*.log
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.docx
+*.doc
+*.pptx
+*.ppt
+*.pdf
+*.msg
+*.eml
+*.db
+*.sqlite
+*.sqlite3
+# Fixture test buatan boleh masuk
+!**/tests/fixtures/**
