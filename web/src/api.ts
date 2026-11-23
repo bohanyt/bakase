@@ -1,4 +1,4 @@
-import type { FileRef } from "./messages";
+import type { FileRef } from "./messages.ts";
 
 export type User = {
   id: number;

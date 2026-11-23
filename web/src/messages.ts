@@ -54,6 +54,7 @@ export type ConversationDetail = {
 export type AnswerMeta = {
   startedAt?: number;
   compacting?: boolean;
+  hasTextAfterTool?: boolean;
   durationMs?: number;
   /** ID pesan di server; dibutuhkan untuk mengirim feedback. */
   messageId?: number;

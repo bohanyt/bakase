@@ -1,9 +1,9 @@
 import type { ChatModelAdapter, ThreadMessage } from "@assistant-ui/react";
-import { UNAUTHORIZED_EVENT } from "./api";
-import { getJoke } from "./joke";
-import type { AnswerMeta, ConversationSummary, FileRef, SourceRef, Step } from "./messages";
-import { readPageAction } from "./pageAction";
-import { answerPageAction, consumePageRefresh, livePage, releasePage, verifyPageRefresh } from "./pageBridge";
+import { UNAUTHORIZED_EVENT } from "./api.ts";
+import { getJoke } from "./joke.ts";
+import type { AnswerMeta, ConversationSummary, FileRef, SourceRef, Step } from "./messages.ts";
+import { readPageAction } from "./pageAction.ts";
+import { answerPageAction, consumePageRefresh, livePage, releasePage, verifyPageRefresh } from "./pageBridge.ts";
 
 export type ChatHooks = {
   /** ID percakapan yang sedang dibuka, atau null untuk percakapan baru. */
@@ -25,7 +25,7 @@ function lastUserMessage(messages: readonly ThreadMessage[]) {
 }
 
 /** Server memegang riwayat; browser hanya mengirim pesan terbaru. */
-export function createChatAdapter(hooks: ChatHooks): ChatModelAdapter {
+export function createChatAdapter(hooks: ChatHooks) {
   return {
     async *run({ messages, abortSignal }) {
       const startedAt = Date.now();
@@ -85,6 +85,8 @@ export function createChatAdapter(hooks: ChatHooks): ChatModelAdapter {
       let durationMs: number | undefined;
       let messageId: number | undefined;
       let streamError: Error | undefined;
+      let receivedDone = false;
+      let hasTextAfterTool: boolean | undefined;
       let steps: Step[] = [];
       let files: FileRef[] = [];
       let sources: SourceRef[] = [];
@@ -94,7 +96,7 @@ export function createChatAdapter(hooks: ChatHooks): ChatModelAdapter {
           ...(reasoning ? [{ type: "reasoning" as const, text: reasoning }] : []),
           { type: "text" as const, text },
         ],
-        metadata: { custom: { startedAt, compacting, durationMs, messageId, steps, files, sources } },
+        metadata: { custom: { startedAt, compacting, durationMs, messageId, steps, files, sources, hasTextAfterTool } },
       });
 
       try {
@@ -128,7 +130,9 @@ export function createChatAdapter(hooks: ChatHooks): ChatModelAdapter {
               if (!compacting) hooks.onSummary(payload.summary ?? null);
               yield snapshot();
             } else if (event === "delta") {
-              text += payload.text as string;
+              const delta = payload.text as string;
+              text += delta;
+              if (hasTextAfterTool === false && delta.trim()) hasTextAfterTool = true;
               if (payload.sources?.length) sources = [...sources, ...payload.sources as SourceRef[]];
               yield snapshot();
             } else if (event === "reasoning") {
@@ -136,9 +140,12 @@ export function createChatAdapter(hooks: ChatHooks): ChatModelAdapter {
               yield snapshot();
             } else if (event === "step") {
               const step = payload as Step;
-              steps = steps.some((s) => s.id === step.id)
-                ? steps.map((s) => (s.id === step.id ? step : s))
-                : [...steps, step];
+              if (steps.some((s) => s.id === step.id)) {
+                steps = steps.map((s) => (s.id === step.id ? step : s));
+              } else {
+                hasTextAfterTool = false;
+                steps = [...steps, step];
+              }
               yield snapshot();
             } else if (event === "page_action" && page) {
               const action = readPageAction(payload);
@@ -161,6 +168,7 @@ export function createChatAdapter(hooks: ChatHooks): ChatModelAdapter {
               // Server masih bisa menyimpan jawaban sebagian dan mengirim ID lewat done.
               streamError = new Error(payload.message as string);
             } else if (event === "done") {
+              receivedDone = true;
               text = finalText ?? text;
               if (!streamError) durationMs = payload.duration_ms as number;
               messageId = (payload.message_id as number | null) ?? undefined;
@@ -168,7 +176,13 @@ export function createChatAdapter(hooks: ChatHooks): ChatModelAdapter {
             }
           }
         }
+        if (abortSignal.aborted) return;
         if (streamError) throw streamError;
+        if (!receivedDone) {
+          throw new Error("Jawaban terputus di tengah jalan. Kirim ulang pertanyaannya. Kalau terus terjadi, hubungi IT.");
+        }
+      } catch (error) {
+        if (!abortSignal.aborted) throw error;
       } finally {
         if (abortSignal.aborted && page) releasePage(page);
         pageAbort.abort();
@@ -176,5 +190,5 @@ export function createChatAdapter(hooks: ChatHooks): ChatModelAdapter {
         hooks.onDone();
       }
     },
-  };
+  } satisfies ChatModelAdapter;
 }

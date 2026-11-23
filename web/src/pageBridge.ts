@@ -5,9 +5,9 @@
 // Pesan hanya dikirim ke, dan diterima dari, origin extension yang terdaftar di server
 // (`[auth] extension_ids`). Halaman lain tidak bisa memasang Bakase di iframe (CSP
 // frame-ancestors), jadi tidak ada pihak lain yang bisa ikut menjawab.
-import { allowedOrigin, readProgress, readReply, type PageRead } from "./pageRead";
-import { pageActionTiming, readActionReply, type ActionReply, type PageAction } from "./pageAction";
-import { createPageSession, pageChanged, type LivePage } from "./pageSession";
+import { allowedOrigin, readProgress, readReply, type PageRead } from "./pageRead.ts";
+import { pageActionTiming, readActionReply, type ActionReply, type PageAction } from "./pageAction.ts";
+import { createPageSession, pageChanged, type LivePage } from "./pageSession.ts";
 
 const TIMEOUT_MS = 120_000;
 

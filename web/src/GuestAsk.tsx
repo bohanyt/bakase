@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 
 import { ArrowUpIcon, SignInIcon } from "@phosphor-icons/react";
 import { Streamdown } from "streamdown";
 import { BlockedImage } from "./BlockedImage";
+import { Mascot } from "./Mascot";
 import { saveFollowUp } from "./guestFollowUp";
 
 const MAX_CHARS = 1000;
@@ -105,7 +106,7 @@ export function GuestAsk({ onWantLogin }: { onWantLogin: () => void }) {
     return (
       <div className="guest">
         <div className="guest-head">
-          <img src="/brand/mascot.png" width={104} height={104} alt="" />
+          <Mascot asset="welcome" placement="welcome" />
           <h2>Mau tanya apa?</h2>
           <p>Satu pertanyaan cepat tanpa login.</p>
         </div>
@@ -144,7 +145,11 @@ export function GuestAsk({ onWantLogin }: { onWantLogin: () => void }) {
       <div className="guest-thread" aria-live="polite">
         <p className="guest-question">{asked}</p>
         <div className="guest-answer">
-          <img src="/brand/mascot.png" width={28} height={28} alt="" />
+          <Mascot
+            className="guest-mascot"
+            asset={error ? "kaget" : phase === "done" ? "diam" : answer ? "bicara" : "mikir"}
+            placement={phase === "done" && !error ? "guestIdle" : "guest"}
+          />
           <div className="md">
             {answer ? (
               <Streamdown

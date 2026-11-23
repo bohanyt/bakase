@@ -545,6 +545,11 @@ body.resizing {
 .welcome-mascot {
   display: block;
 }
+.mascot-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
 
 .viewport {
   flex: 1;
@@ -597,6 +602,11 @@ body.resizing {
 }
 .msg-error {
   color: var(--accent);
+}
+.msg-error:has(> .working-mascot) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .working,
@@ -1744,7 +1754,7 @@ body.resizing {
   animation: auth-pop 0.5s ease-out 0.4s both;
 }
 .auth-mascot {
-  width: min(232px, 40vw);
+  max-width: 40vw;
   height: auto;
 }
 .auth-hints {
@@ -1855,7 +1865,8 @@ body.resizing {
   border-radius: 16px;
   background: var(--bg);
 }
-.guest-answer img {
+.guest-answer img,
+.guest-mascot {
   flex: none;
 }
 .guest-answer .md {
@@ -3313,30 +3324,4 @@ td select {
   display: block;
   max-width: none !important;
   height: auto !important;
-}
-
-.compaction-mascot {
-  display: inline-flex;
-  flex: none;
-  position: relative;
-}
-
-.compaction-pen {
-  position: absolute;
-  right: -3px;
-  bottom: -2px;
-  padding: 2px;
-  border-radius: 50%;
-  background: var(--bg);
-  color: var(--accent);
-  animation: compaction-writing 650ms ease-in-out 3 alternate;
-}
-
-@keyframes compaction-writing {
-  from { transform: translate(-4px, 1px) rotate(-12deg); }
-  to { transform: translate(1px, -2px) rotate(8deg); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .compaction-pen { animation: none; }
 }

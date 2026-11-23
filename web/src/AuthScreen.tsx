@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { ClipboardTextIcon, FileXlsIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
 import { api, type AuthOptions, type User } from "./api";
 import { GuestAsk } from "./GuestAsk";
+import { Mascot } from "./Mascot";
 import { SupportLink } from "./SupportLink";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -78,7 +79,7 @@ export function AuthScreen({ onLogin }: { onLogin: (user: User) => void }) {
         </div>
 
         <div className="auth-body">
-          <img className="auth-mascot-small" src="/brand/mascot.png" width={70} height={70} alt="" />
+          <Mascot className="auth-mascot-small" asset="welcome" placement="loginSmall" />
           <h1 className="auth-title">Tanya, cari, beres.</h1>
           <p className="auth-lead">Bakase membantu mencari dan merangkum dokumen kerja, serta membuat file Excel dan Word.</p>
 
@@ -163,7 +164,7 @@ export function AuthScreen({ onLogin }: { onLogin: (user: User) => void }) {
         <aside className="auth-visual" aria-hidden="true">
           <div className="auth-stage">
             <p className="auth-bubble">Halo! Aku Bakase. Mau cari apa hari ini?</p>
-            <img className="auth-mascot" src="/brand/mascot.png" width={232} height={232} alt="" />
+            <Mascot className="auth-mascot" asset="welcome" placement="login" />
             <ul className="auth-hints">
               {HINTS.map(({ icon: Icon, text }) => (
                 <li key={text}>

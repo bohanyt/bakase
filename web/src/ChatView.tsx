@@ -20,7 +20,6 @@ import {
   DownloadSimpleIcon,
   EyeIcon,
   PaperclipIcon,
-  PencilSimpleIcon,
   SpinnerGapIcon,
   StopIcon,
   WarningCircleIcon,
@@ -36,6 +35,8 @@ import { Feedback } from "./Feedback";
 import { BlockedImage } from "./BlockedImage";
 import { takeFollowUp } from "./guestFollowUp";
 import { getJoke, setJoke } from "./joke";
+import { Mascot } from "./Mascot";
+import { workingMascotState } from "./mascotState";
 import { FileIcon } from "./FileIcon";
 import { PageButton } from "./PageButton";
 import { formatSize, kindLabel, mergeThreadMessages, serverMessageId, type AnswerMeta, type ConversationDetail, type ConversationSummary, type SourceRef } from "./messages";
@@ -129,10 +130,18 @@ function Reasoning({ text }: { text: string }) {
   );
 }
 
-/** "Sedang berpikir · 5 dtk" saat jawaban berjalan, "Selesai dalam 12 dtk" sesudahnya. */
+const WORKING_LABELS = {
+  focus: "Mencari dokumen",
+  mikir: "Sedang berpikir",
+  bicara: "Menjawab",
+};
+
 function WorkingTime() {
-  const running = useAuiState((s) => s.message.status?.type === "running");
   const custom = useAuiState((s) => s.message.metadata?.custom as AnswerMeta | undefined);
+  const state = useAuiState((s) => s.message.status?.type === "running"
+    ? workingMascotState(s.message.content, s.message.metadata.custom as AnswerMeta)
+    : null);
+  const running = state !== null;
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -141,23 +150,23 @@ function WorkingTime() {
     return () => window.clearInterval(t);
   }, [running]);
 
-  if (running && custom?.compacting) {
+  if (state === "tired") {
     return (
       <div className="working compaction-status" role="status">
-        <span className="compaction-mascot" aria-hidden="true">
-          <img src="/brand/mascot.png" width={28} height={28} alt="" />
-          <PencilSimpleIcon className="compaction-pen" size={14} weight="bold" />
-        </span>
+        <Mascot className="working-mascot" asset={state} placement="compaction" />
         Merangkum obrolan sejauh ini…
       </div>
     );
   }
-  if (running) {
+  if (state) {
     const elapsed = custom?.startedAt ? now - custom.startedAt : 0;
     return (
       <div className="working">
-        <img className="working-mascot" src="/brand/mascot.png" width={24} height={24} alt="" />
-        Sedang berpikir · {formatSeconds(elapsed)}
+        <Mascot className="working-mascot" asset={state} />
+        <span>
+          <span role="status">{WORKING_LABELS[state]}</span>
+          <span aria-hidden="true"> · {formatSeconds(elapsed)}</span>
+        </span>
       </div>
     );
   }
@@ -272,7 +281,10 @@ function AssistantMessage() {
       <AnswerImages />
       <FileCards />
       <MessagePrimitive.Error>
-        <p className="msg-error">Gagal mendapat jawaban. Coba kirim ulang.</p>
+        <p className="msg-error">
+          <Mascot className="working-mascot" asset="kaget" />
+          Gagal mendapat jawaban. Coba kirim ulang.
+        </p>
       </MessagePrimitive.Error>
       <ActionBarPrimitive.Root hideWhenRunning autohide="never" className="actions-bar">
         <ActionBarPrimitive.Copy className="icon-btn" aria-label="Salin jawaban">
@@ -315,7 +327,7 @@ function JokeToggle() {
       title={on ? "Bakase menjawab lebih santai, dengan humor ringan" : "Nyalakan supaya Bakase menjawab lebih santai"}
       onClick={toggle}
     >
-      <img src="/brand/mascot.png" width={22} height={22} alt="" />
+      <Mascot asset={on ? "smug" : "diam"} placement="joke" />
       Joke {on ? "on" : "off"}
     </button>
   );
@@ -554,7 +566,7 @@ export function ChatView({
         <AuiIf condition={(s) => s.thread.isEmpty}>
           <div className="welcome">
             <div className="welcome-head">
-              <img className="welcome-mascot" src="/brand/mascot.png" width={104} height={104} alt="" />
+              <Mascot className="welcome-mascot" asset="welcome" placement="welcome" />
               <h1>Mau tanya apa, {firstName}?</h1>
             </div>
             <Composer quotes={quotes} onQuotesChange={onQuotesChange} draft={draft} />
