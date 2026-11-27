@@ -33,18 +33,27 @@ pub struct ChatMessage {
 }
 
 impl Llm {
+    pub(crate) fn deployment(&self) -> &str {
+        &self.deployment
+    }
+
     pub fn new(cfg: &AzureConfig) -> Self {
         let oa = OaAzure::new()
             .with_api_base(cfg.endpoint.trim_end_matches('/'))
             .with_deployment_id(&cfg.deployment)
             .with_api_version(&cfg.api_version)
             .with_api_key(&cfg.api_key);
+        // Hanya menyambung yang dibatasi di sini; jeda di antara event dibatasi loop agen.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
         let v1 = OpenAIConfig::new()
             .with_api_base(format!("{}/openai/v1", cfg.endpoint.trim_end_matches('/')))
             .with_api_key(&cfg.api_key);
         Self {
-            client: Client::with_config(oa),
-            responses: Client::with_config(v1),
+            client: Client::build(http.clone(), oa),
+            responses: Client::build(http, v1),
             deployment: cfg.deployment.clone(),
         }
     }
@@ -65,9 +74,13 @@ impl Llm {
 
     /// Satu permintaan Responses API tanpa streaming, tanpa menyimpan apa pun di Azure
     /// (`store: false`). Reasoning dikembalikan terenkripsi supaya bisa dikirim lagi
-    /// di giliran berikutnya, seperti cara Codex.
+    /// di giliran berikutnya, seperti cara openai/codex.
     pub async fn respond(&self, input: Value, extra: Value) -> anyhow::Result<Value> {
-        let request = with_fixed(extra, self.fixed(input, false));
+        self.respond_request(self.request(input, extra, false))
+            .await
+    }
+
+    pub(crate) async fn respond_request(&self, request: Value) -> anyhow::Result<Value> {
         Ok(self
             .responses
             .responses()
@@ -79,26 +92,27 @@ impl Llm {
     /// (`response.output_text.delta`, `response.completed`, dan seterusnya).
     pub async fn respond_stream(
         &self,
-        input: Value,
-        extra: Value,
-    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<Value>>> {
-        let request = with_fixed(extra, self.fixed(input, true));
+        request: &Value,
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<Value>> + use<>> {
         let stream = self
             .responses
             .responses()
-            .create_stream_byot::<Value, Value>(request)
+            .create_stream_byot::<&Value, Value>(request)
             .await?;
         Ok(stream.map(|event| event.map_err(|e| anyhow::anyhow!(e))))
     }
 
-    fn fixed(&self, input: Value, stream: bool) -> Value {
-        json!({
-            "model": self.deployment,
-            "input": input,
-            "store": false,
-            "include": ["reasoning.encrypted_content"],
-            "stream": stream,
-        })
+    pub(crate) fn request(&self, input: Value, extra: Value, stream: bool) -> Value {
+        with_fixed(
+            extra,
+            json!({
+                "model": self.deployment,
+                "input": input,
+                "store": false,
+                "include": ["reasoning.encrypted_content"],
+                "stream": stream,
+            }),
+        )
     }
 }
 

@@ -20,7 +20,7 @@ use axum::{
     http::{HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use rusqlite::params_from_iter;
+use rusqlite::{OptionalExtension, params_from_iter};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,7 +146,7 @@ pub(crate) async fn rows_with_guard(
     }
     db.call(move |c| {
         let _guard = guard;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
         let mut out = HashMap::new();
         for ids in ids.chunks(500) {
             let marks = vec!["?"; ids.len()].join(",");
@@ -741,8 +741,11 @@ fn list_in(
     Ok(page)
 }
 
+pub(crate) const NOT_FOUND: &str = "Dokumen tidak ditemukan atau sudah tidak ada.";
+pub(crate) const CALC_CHUNK_SUFFIX: &str = "-hitung";
+
 fn not_found() -> ApiError {
-    ApiError::not_found("Dokumen tidak ditemukan atau sudah tidak ada.")
+    ApiError::not_found(NOT_FOUND)
 }
 
 fn unavailable() -> ApiError {
@@ -841,6 +844,21 @@ pub async fn chunk(
     let Some(index) = state.docs.clone() else {
         return Err(unavailable());
     };
+    if let Some(id) = chunk_id
+        .strip_suffix(CALC_CHUNK_SUFFIX)
+        .and_then(doc_of_chunk)
+    {
+        let (document, _) = original(&state.db, &index, &user, &state.sources, id).await?;
+        if !is_excel(&document.kind) {
+            return Err(not_found());
+        }
+        return Ok(Json(serde_json::json!({
+            "chunk_id": chunk_id,
+            "page": null,
+            "text": "Bakase menghitung dari workbook Excel ini.",
+            "document": document,
+        })));
+    }
     let doc_id = doc_of_chunk(&chunk_id).ok_or_else(not_found)?;
     // Hak akses dicek dari dokumennya sebelum isi potongan dibaca.
     let document = row(&state.db, &index, doc_id)
@@ -987,25 +1005,7 @@ pub async fn download(
     let Some(index) = state.docs.clone() else {
         return Err(unavailable());
     };
-    let document = row(&state.db, &index, id)
-        .await
-        .map_err(ApiError::from)?
-        .filter(|d| d.allows_entry(&user, &state.sources))
-        .ok_or_else(not_found)?;
-    let who = user.clone();
-    let indexed = tokio::task::spawn_blocking(move || index.has_readable_entry(id, &who))
-        .await
-        .map_err(|e| ApiError::from(anyhow::Error::from(e)))?
-        .map_err(ApiError::from)?;
-    if !indexed {
-        return Err(not_found());
-    }
-    // File asli hanya diambil dari folder yang sama dengan saat dokumen diindeks, karena
-    // hak aksesnya mengikuti folder itu. Kalau folder sumber di config berganti, tunggu
-    // ingest berikutnya.
-    let root =
-        source_root(&state.sources, &document.source, &document.root).ok_or_else(not_found)?;
-    let path = resolve(&root, &document.rel_path).ok_or_else(not_found)?;
+    let (document, path) = original(&state.db, &index, &user, &state.sources, id).await?;
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1077,6 +1077,112 @@ pub async fn download(
     Ok(response)
 }
 
+async fn original(
+    db: &Db,
+    index: &Arc<DocIndex>,
+    user: &AuthUser,
+    sources: &Arc<Vec<SourceConfig>>,
+    id: i64,
+) -> Result<(DocumentRow, std::path::PathBuf), ApiError> {
+    let document = row(db, index, id)
+        .await
+        .map_err(ApiError::from)?
+        .filter(|d| d.allows_entry(user, sources))
+        .ok_or_else(not_found)?;
+    let (index, user, sources) = (index.clone(), user.clone(), sources.clone());
+    tokio::task::spawn_blocking(move || {
+        if !index
+            .has_readable_entry(id, &user)
+            .map_err(ApiError::from)?
+        {
+            return Err(not_found());
+        }
+        // Hak akses file mengikuti folder yang dipakai saat dokumen diindeks.
+        let root = source_root(&sources, &document.source, &document.root).ok_or_else(not_found)?;
+        let path = resolve(&root, &document.rel_path).ok_or_else(not_found)?;
+        Ok((document, path))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow::Error::from(e)))?
+}
+
+pub(crate) fn is_excel(kind: &str) -> bool {
+    matches!(kind, "xlsx" | "xlsm" | "xls")
+}
+
+pub(crate) async fn excel_snapshot(
+    db: &Db,
+    index: &Arc<DocIndex>,
+    user: &AuthUser,
+    sources: &Arc<Vec<SourceConfig>>,
+    id: i64,
+) -> Result<(DocumentRow, Vec<u8>), String> {
+    let mut user = user.clone();
+    if user.id != 0 {
+        // ID 0 hanya dipakai oleh perintah CLI `tanya`.
+        let user_id = user.id;
+        let (departments, role) = db.call(move |c| {
+            Ok(c.query_row(
+                "SELECT departments, role FROM users_with_access WHERE id = ? AND status = 'active'",
+                [user_id],
+                |r| Ok((crate::access::from_row(r, 0)?, r.get::<_, String>(1)?)),
+            ).optional()?)
+        }).await.ok().flatten().ok_or(NOT_FOUND)?;
+        user.departments = departments;
+        user.role = crate::acl::Role::parse(&role).ok_or(NOT_FOUND)?;
+    }
+    let (document, path) = original(db, index, &user, sources, id)
+        .await
+        .map_err(|_| NOT_FOUND)?;
+    if !is_excel(&document.kind) {
+        return Err("Dokumen sumber itu bukan file Excel (.xlsx, .xlsm, atau .xls).".into());
+    }
+    let bytes = tokio::task::spawn_blocking(move || read_excel_snapshot(&path))
+        .await
+        .map_err(|_| NOT_FOUND)??;
+    Ok((document, bytes))
+}
+
+fn read_excel_snapshot(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::{ErrorKind, Read};
+    let busy =
+        "File Excel sumber sedang dipakai atau berubah. Coba hitung lagi setelah file disimpan.";
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ | FILE_SHARE_DELETE: cegah penulisan ke handle yang sedang disalin.
+        options.share_mode(0x1 | 0x4);
+    }
+    let mut file = options.open(path).map_err(|err| match err.kind() {
+        ErrorKind::NotFound | ErrorKind::PermissionDenied => NOT_FOUND,
+        _ => busy,
+    })?;
+    let before = file.metadata().map_err(|_| NOT_FOUND)?;
+    let max = crate::attachments::MAX_CALC_BYTES as u64;
+    let too_large = "File Excel melewati batas 64 MiB. Pecah file dan hitung per bagian.";
+    if before.len() > max {
+        return Err(too_large.into());
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    (&mut file)
+        .take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| busy)?;
+    if bytes.len() as u64 > max {
+        return Err(too_large.into());
+    }
+    let after = file.metadata().map_err(|_| busy)?;
+    if before.len() != bytes.len() as u64
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        return Err(busy.into());
+    }
+    Ok(bytes)
+}
+
 pub(crate) fn source_root(
     sources: &[SourceConfig],
     source: &str,
@@ -1103,6 +1209,7 @@ fn mime_of(kind: &str) -> &'static str {
     match kind {
         "pdf" => "application/pdf",
         "xlsx" => crate::files::XLSX_MIME,
+        "xlsm" => "application/vnd.ms-excel.sheet.macroEnabled.12",
         "docx" => crate::docx::DOCX_MIME,
         "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "xls" => "application/vnd.ms-excel",

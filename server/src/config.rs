@@ -223,6 +223,15 @@ pub struct AuthConfig {
     /// samping. Kosong berarti Bakase tidak bisa ditampilkan di frame milik situs lain.
     #[serde(default)]
     pub extension_ids: Vec<String>,
+    pub microsoft: Option<crate::microsoft::Settings>,
+}
+
+impl AuthConfig {
+    pub fn microsoft_full(&self) -> bool {
+        self.microsoft
+            .as_ref()
+            .is_some_and(|m| m.enabled && m.pilot.is_empty())
+    }
 }
 
 impl Default for AuthConfig {
@@ -233,6 +242,7 @@ impl Default for AuthConfig {
             secure_cookie: false,
             departments: default_departments(),
             extension_ids: Vec::new(),
+            microsoft: None,
         }
     }
 }
@@ -295,6 +305,9 @@ impl Config {
             }
         }
         cfg.check_sources()?;
+        if let Some(microsoft) = &mut cfg.auth.microsoft {
+            microsoft.validate(&cfg.auth.email_domain, cfg.auth.secure_cookie)?;
+        }
         Ok(cfg)
     }
 
@@ -309,6 +322,24 @@ impl Config {
             );
         }
         Ok(())
+    }
+
+    /// Dua sumber yang foldernya sama atau salah satunya di dalam yang lain. Sumber di dalam
+    /// folder data tidak dihitung, karena ingest melewatinya.
+    pub fn nested_sources(&self) -> Option<(&str, &str)> {
+        let data = std::fs::canonicalize(&self.data_dir).ok();
+        let roots: Vec<_> = self
+            .sources
+            .iter()
+            .filter_map(|s| Some((s.name.as_str(), std::fs::canonicalize(&s.path).ok()?)))
+            .filter(|(_, root)| !data.as_ref().is_some_and(|data| root.starts_with(data)))
+            .collect();
+        roots.iter().enumerate().find_map(|(i, (a, first))| {
+            roots[i + 1..]
+                .iter()
+                .find(|(_, second)| first.starts_with(second) || second.starts_with(first))
+                .map(|(b, _)| (*a, *b))
+        })
     }
 
     pub fn require_api_key(&self) -> Result<()> {

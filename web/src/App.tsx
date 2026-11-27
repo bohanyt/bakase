@@ -1,28 +1,58 @@
 import type { ThreadMessageLike } from "@assistant-ui/react";
 import { ArrowLeftIcon, ListIcon } from "@phosphor-icons/react";
-import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
-import { AdminPage, type AdminTab } from "./AdminPage";
-import { api, UNAUTHORIZED_EVENT, type AuthOptions, type User } from "./api";
+import { useCallback, useEffect, useEffectEvent, useRef, useState, lazy, Suspense } from "react";
+import type { AdminTab } from "./AdminPage";
+import { api, ApiError, SESSION_CHECK_EVENT, setTabUser, UNAUTHORIZED_EVENT, type AppCard, type AuthOptions, type User } from "./api";
 import { AuthScreen } from "./AuthScreen";
+import { microsoftParams } from "./microsoftLogin";
 import { ChangePassword } from "./ChangePassword";
 import { ChatView } from "./ChatView";
 import { CiteContext } from "./citeContext";
+import { AppsPage } from "./AppsPage";
 import { DocumentsPage } from "./DocumentsPage";
+import { FilesPage } from "./FilesPage";
 import { DocumentPreview } from "./DocumentPreview";
 import { FilePreview } from "./FilePreview";
+import { ExtensionDialog, ExtensionUpdateNotice, HelpMenu } from "./HelpMenu";
+import { extensionUpdateAvailable } from "./extensionVersion";
 import { toThreadMessages, type ConversationDetail, type ConversationSummary } from "./messages";
+import { inPanel } from "./pageBridge";
 import { PreviewContext, ReloadAppContext, previewKey, type PreviewTarget } from "./previewContext";
 import { newQuote, quoteError, type Quote, type QuoteDraft } from "./quote";
 import { SelectionCite } from "./Quotes";
 import { saveReloadDraft, takeReloadDraft, type DraftSnapshot } from "./reloadDraft";
 import { SearchDialog } from "./SearchDialog";
 import { SourcePreview } from "./SourcePreview";
-import { Sidebar, type Conversation } from "./Sidebar";
-import { SupportLink } from "./SupportLink";
+import { Sidebar, type Conversation, type SidePage } from "./Sidebar";
 import { ThemeToggle } from "./ThemeToggle";
 import "./App.css";
 
-type View = "chat" | "admin" | "password" | "documents";
+type AdminPageModule = typeof import("./AdminPage");
+
+/** Tab yang masih terbuka sesudah deploy bisa meminta berkas yang sudah tidak ada. */
+const AdminPage = lazy(() =>
+  import("./AdminPage").catch(() => ({ default: AdminLoadError as AdminPageModule["default"] })),
+);
+
+function AdminLoadError() {
+  return (
+    <div className="loading" role="alert">
+      <div>
+        <p>Halaman Admin gagal dimuat.</p>
+        <button type="button" onClick={() => window.location.reload()}>
+          Muat ulang
+        </button>
+      </div>
+    </div>
+  );
+}
+
+const SESSION_CHANNEL = "app-sesi";
+const RETRY_EVENT = "app:coba-lagi";
+/** Jarak terpendek antar pemeriksaan sesi saat tab kembali dibuka. */
+const VISIBLE_CHECK_MS = 60_000;
+
+type View = "chat" | "admin" | "password" | SidePage;
 type Session = {
   key: string;
   conversationId: string | null;
@@ -72,7 +102,12 @@ function messageElement(messageId: number) {
   return document.querySelector<HTMLElement>(`.chat-pane [data-server-id="${messageId}"]`);
 }
 
-function Shell({ user, onLogout }: { user: User; onLogout: () => Promise<void> }) {
+function Shell({ user, authOptions, initialNotice, onLogout }: {
+  user: User;
+  initialNotice: string | null;
+  authOptions: AuthOptions | null | undefined;
+  onLogout: () => Promise<void>;
+}) {
   const [view, setView] = useState<View>("chat");
   const [adminTab, setAdminTab] = useState<AdminTab>("users");
   // File atau potongan dokumen yang sedang dibuka di panel preview kanan.
@@ -90,19 +125,29 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => Promise<void> }
   const [loadingConversation, setLoadingConversation] = useState(false);
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const [width, setWidth] = useState(readWidth);
-  const [supportWhatsapp, setSupportWhatsapp] = useState<string | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const extensionVersion = authOptions?.extension_version;
+  const panel = inPanel();
+  const canUpdateExtension = panel && extensionVersion &&
+    extensionUpdateAvailable(new URLSearchParams(location.search).get("v"), extensionVersion);
+  const openExtensionDialog = () => setInstalling(true);
   // Kutipan yang menunggu dikirim; ikut kosong saat pindah percakapan, seperti isi kotak tanya.
   const [quotes, setQuotes] = useState<Quote[]>([]);
 
-  useEffect(() => {
-    api<AuthOptions>("/api/auth/options").then(
-      (o) => setSupportWhatsapp(o.support_whatsapp ?? null),
-      () => setSupportWhatsapp(null),
-    );
-  }, []);
   const [drawer, setDrawer] = useState(false);
+  // Aplikasi yang boleh dipakai user ini; menu Aplikasi hanya tampil kalau ada.
+  const [apps, setApps] = useState<AppCard[]>([]);
+  useEffect(() => {
+    let active = true;
+    api<AppCard[]>("/api/apps")
+      .then((list) => active && setApps(list))
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [user.id]);
   const [searchOpen, setSearchOpen] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState(initialNotice);
   const [error, setError] = useState<string | null>(null);
   // Nomor urut navigasi: respons yang datang setelah user memilih hal lain diabaikan.
   const navSeq = useRef(0);
@@ -285,6 +330,19 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => Promise<void> }
     return () => { cancelled = true; };
   }, [user.id]);
 
+  // Sesi berakhir di tengah mengetik: draf dikembalikan setelah akun yang sama masuk lagi.
+  const keepDraft = useEffectEvent(() => {
+    const draft = draftRef.current?.();
+    if (draft?.text || draft?.hadAttachments) {
+      saveReloadDraft(user.id, { ...draft, conversationId: session.conversationId });
+    }
+  });
+  useEffect(() => {
+    const onUnauthorized = () => keepDraft();
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  }, []);
+
   function reloadApp() {
     const draft = draftRef.current?.();
     if ((draft?.text || draft?.hadAttachments) && !saveReloadDraft(user.id, { ...draft, conversationId: session.conversationId })) {
@@ -338,7 +396,7 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => Promise<void> }
 
   async function remove(id: string) {
     try {
-      await api(`/api/conversations/${id}`, { method: "DELETE" });
+      await api(`/api/conversations/${id}/archive-v1`, { method: "DELETE" });
       if (id === activeRef.current) newChat();
       else if (id === loadingRef.current) cancelLoading();
       await reload();
@@ -407,8 +465,9 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => Promise<void> }
         onSelect={openConversation}
         onRename={rename}
         onDelete={remove}
-        documentsActive={view === "documents"}
-        onDocuments={() => (setView("documents"), setDrawer(false))}
+        page={view === "documents" || view === "files" || view === "apps" ? view : null}
+        onPage={(page) => (setView(page), setDrawer(false))}
+        showApps={apps.length > 0}
         onAdmin={() => (setView("admin"), setDrawer(false))}
         onPassword={() => (setView("password"), setDrawer(false))}
         onLogout={logout}
@@ -444,10 +503,29 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => Promise<void> }
             </button>
           )}
           <span className="head-spacer" />
-          <SupportLink whatsapp={supportWhatsapp} />
+          <HelpMenu
+            whatsapp={authOptions?.support_whatsapp}
+            canInstall={!!extensionVersion && !panel && viewport > 800}
+            onInstall={openExtensionDialog}
+          />
           <ThemeToggle />
         </header>
 
+        {extensionVersion && installing && (
+          <ExtensionDialog version={extensionVersion} onClose={() => setInstalling(false)} />
+        )}
+        {canUpdateExtension && (
+          <ExtensionUpdateNotice key={extensionVersion} version={extensionVersion} onUpdate={openExtensionDialog} />
+        )}
+        {user.role === "admin" && user.microsoft_secret_days !== undefined && (
+          <p className="ms-callout ms-warning banner" role="status">
+            <strong>Pengingat admin</strong><br />
+            {user.microsoft_secret_days < 0 ? "Kunci masuk Microsoft sudah kedaluwarsa."
+              : user.microsoft_secret_days === 0 ? "Kunci masuk Microsoft kedaluwarsa hari ini."
+              : "Kunci masuk Microsoft kedaluwarsa dalam " + user.microsoft_secret_days + " hari."}
+            {" Perbarui agar akses tetap berjalan."}
+          </p>
+        )}
         {error && (
           <p className="form-error banner" role="alert">
             {error}
@@ -485,7 +563,9 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => Promise<void> }
         </div>
         {view === "admin" && user.role === "admin" && (
           <div className="page-pane">
-            <AdminPage me={user} tab={adminTab} onTab={setAdminTab} onOpenChat={openConversation} />
+            <Suspense fallback={<div className="loading">Memuat Admin…</div>}>
+              <AdminPage me={user} tab={adminTab} onTab={setAdminTab} onOpenChat={openConversation} />
+            </Suspense>
           </div>
         )}
         {view === "documents" && (
@@ -494,6 +574,20 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => Promise<void> }
               openId={preview?.type === "document" ? preview.document.id : null}
               onOpen={(document) => setPreview({ type: "document", document })}
             />
+          </div>
+        )}
+        {view === "files" && (
+          <div className="page-pane">
+            <FilesPage
+              openId={preview?.type === "file" ? preview.file.id : null}
+              onOpen={(file) => setPreview({ type: "file", file })}
+              onOpenChat={openConversation}
+            />
+          </div>
+        )}
+        {view === "apps" && apps.length > 0 && (
+          <div className="page-pane">
+            <AppsPage apps={apps} />
           </div>
         )}
         {view === "password" && (
@@ -532,6 +626,7 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => Promise<void> }
             <SourcePreview
               key={previewKey(preview)}
               source={preview.source}
+              originalPage={preview.originalPage}
               width={previewWidth}
               overlay={previewOverlay}
               onClose={() => setPreview(null)}
@@ -566,26 +661,146 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => Promise<void> }
 
 export default function App() {
   const [user, setUser] = useState<User | null | undefined>(undefined);
+  const [authOptions, setAuthOptions] = useState<AuthOptions | null>();
 
   useEffect(() => {
-    api<User>("/api/me").then(setUser, () => setUser(null));
-    const onUnauthorized = () => setUser(null);
-    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
-    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    let active = true;
+    let pending = false;
+    async function loadOptions() {
+      if (pending) return;
+      pending = true;
+      try {
+        const options = await api<AuthOptions>("/api/auth/options");
+        if (active) setAuthOptions(options);
+        window.removeEventListener("online", loadOptions);
+      } catch {
+        if (active) setAuthOptions(null);
+      } finally {
+        pending = false;
+      }
+    }
+    window.addEventListener("online", loadOptions);
+    void loadOptions();
+    return () => {
+      active = false;
+      window.removeEventListener("online", loadOptions);
+    };
   }, []);
 
-  if (user === undefined) return <div className="loading full">Memuat…</div>;
-  if (user === null) return <AuthScreen onLogin={setUser} />;
+  const shown = useRef<User | null | undefined>(undefined);
+  const [unreachable, setUnreachable] = useState(false);
+  const [ended, setEnded] = useState(false);
+  const [switched, setSwitched] = useState(false);
+
+  const show = useCallback((next: User | null) => {
+    const before = shown.current;
+    shown.current = next;
+    setTabUser(next?.id ?? null);
+    setUnreachable(false);
+    if (next) setEnded(false);
+    setSwitched(!!before && !!next && before.id !== next.id);
+    // Objek lama dipertahankan kalau orangnya sama, supaya Shell tidak dirender ulang.
+    setUser((current) => (current && next && JSON.stringify(current) === JSON.stringify(next) ? current : next));
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let pending = false;
+    let again = false;
+    let checkedAt = 0;
+    async function check() {
+      // Balasan yang sedang ditunggu bisa masih tentang akun lama, jadi dicek sekali lagi.
+      again = pending;
+      if (pending) return;
+      pending = true;
+      checkedAt = Date.now();
+      try {
+        const me = await api<User>("/api/me");
+        if (active) show(me);
+      } catch (err) {
+        // 401 ditangani onUnauthorized. Gangguan lain tidak boleh mengeluarkan user.
+        const unauthorized = err instanceof ApiError && err.status === 401;
+        if (active && !unauthorized && shown.current === undefined) setUnreachable(true);
+      } finally {
+        pending = false;
+        if (again && active) void check();
+      }
+    }
+    const onUnauthorized = () => {
+      if (shown.current) setEnded(true);
+      show(null);
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && Date.now() - checkedAt > VISIBLE_CHECK_MS) void check();
+    };
+    const onSession = (e: MessageEvent<number | null>) => {
+      if (e.data !== (shown.current?.id ?? null)) void check();
+    };
+    const channel = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(SESSION_CHANNEL);
+    channel?.addEventListener("message", onSession);
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    window.addEventListener(SESSION_CHECK_EVENT, check);
+    window.addEventListener(RETRY_EVENT, check);
+    window.addEventListener("online", check);
+    document.addEventListener("visibilitychange", onVisible);
+    void check();
+    return () => {
+      active = false;
+      channel?.close();
+      window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+      window.removeEventListener(SESSION_CHECK_EVENT, check);
+      window.removeEventListener(RETRY_EVENT, check);
+      window.removeEventListener("online", check);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [show]);
+
+  // Tab lain memeriksa sesinya begitu akun di tab ini berganti.
+  const userId = user === undefined ? undefined : (user?.id ?? null);
+  useEffect(() => {
+    if (userId === undefined || typeof BroadcastChannel === "undefined") return;
+    const channel = new BroadcastChannel(SESSION_CHANNEL);
+    channel.postMessage(userId);
+    channel.close();
+  }, [userId]);
+
+  if (user === undefined) {
+    return unreachable ? (
+      <div className="loading full" role="alert">
+        <div>
+          <p>Bakase tidak bisa dihubungi. Sambungkan ke jaringan kantor atau VPN, lalu coba lagi.</p>
+          <button type="button" className="link" onClick={() => window.dispatchEvent(new Event(RETRY_EVENT))}>
+            Coba lagi
+          </button>
+        </div>
+      </div>
+    ) : (
+      <div className="loading full">Memuat…</div>
+    );
+  }
+  const { tab, result } = microsoftParams();
+  if (user === null || tab) {
+    return (
+      <AuthScreen
+        options={authOptions}
+        onLogin={show}
+        note={ended ? "Sesi berakhir. Masuk lagi untuk melanjutkan." : undefined}
+        panelTabReady={tab && result === "done" && !!user}
+      />
+    );
+  }
 
   // Shell dipasang ulang per user, jadi percakapan tidak terbawa ke akun lain.
   return (
     <Shell
       key={user.id}
       user={user}
+      initialNotice={switched ? `Akun di tab ini berganti ke ${user.name}.` : null}
+      authOptions={authOptions}
       onLogout={async () => {
         // Layar masuk hanya tampil setelah server benar-benar menghapus sesi.
         await api("/api/auth/logout", { body: {} });
-        setUser(null);
+        show(null);
       }}
     />
   );

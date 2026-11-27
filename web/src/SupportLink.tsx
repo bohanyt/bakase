@@ -3,22 +3,21 @@ import { WhatsappLogoIcon } from "@phosphor-icons/react";
 const MESSAGE = "Halo IT, saya ada masalah di Bakase: ";
 
 /** Tautan bantuan ke WhatsApp IT. Tidak tampil kalau nomornya belum diatur di server. */
-export function SupportLink({ whatsapp }: { whatsapp?: string | null }) {
+export function SupportLink({ whatsapp, menu = false }: { whatsapp?: string | null; menu?: boolean }) {
   if (!whatsapp) return null;
-  const href = `https://wa.me/${whatsapp}?text=${encodeURIComponent(MESSAGE)}`;
   return (
     <a
-      className="support-link"
-      href={href}
+      className={menu ? undefined : "support-link"}
+      href={`https://wa.me/${whatsapp}?text=${encodeURIComponent(MESSAGE)}`}
       target="_blank"
       rel="noopener noreferrer"
-      title="Chat WhatsApp dengan IT"
-      aria-label="Ada masalah? Hubungi IT lewat WhatsApp"
+      title={menu ? undefined : "Chat WhatsApp dengan IT"}
+      aria-label={menu ? undefined : "Ada masalah? Hubungi IT lewat WhatsApp"}
     >
-      <WhatsappLogoIcon size={18} weight="fill" />
-      <span>
+      <WhatsappLogoIcon className={menu ? "help-whatsapp" : undefined} size={menu ? 20 : 18} weight="fill" />
+      {menu ? <span>Hubungi IT<small>Lewat WhatsApp</small></span> : <span>
         Ada masalah? <strong>Hubungi IT</strong>
-      </span>
+      </span>}
     </a>
   );
 }

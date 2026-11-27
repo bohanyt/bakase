@@ -46,10 +46,13 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let note = crate::request_log::ErrorNote(self.message.clone());
+        let mut res = (
             self.status,
             Json(serde_json::json!({ "message": self.message })),
         )
-            .into_response()
+            .into_response();
+        res.extensions_mut().insert(note);
+        res
     }
 }

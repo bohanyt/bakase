@@ -62,7 +62,7 @@ export function useAttachmentDraft() {
   }, []);
 
   const add = useCallback(
-    (files: readonly File[], pasted = false, pageId?: string) => {
+    (files: readonly File[], pasted = false, pageId?: string, focus?: string) => {
       setNotice(null);
       const problems: string[] = [];
       const added: Draft[] = [];
@@ -93,7 +93,7 @@ export function useAttachmentDraft() {
       if (!added.length) return;
       commit([...listRef.current, ...added]);
       for (const draft of added) {
-        const { done, abort } = uploadAttachment(draft.file, draft.name, (progress) => update(draft.key, { progress }));
+        const { done, abort } = uploadAttachment(draft.file, draft.name, (progress) => update(draft.key, { progress }), focus);
         update(draft.key, { abort });
         done.then(
           (ref) => {

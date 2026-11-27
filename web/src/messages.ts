@@ -17,6 +17,8 @@ export type SourceRef = {
   source: string;
   kind: string;
   page: number | null;
+  scan?: boolean;
+  handwriting?: number[] | "belum_dicek";
   sheet?: string;
   image?: { key: string; place: string; similar: boolean };
 };
@@ -42,6 +44,8 @@ export type StoredMessage = {
   reasoning: string | null;
   steps: Step[];
   sources?: SourceRef[];
+  /** Jawaban berhenti sebelum selesai. */
+  partial?: boolean;
 };
 
 export type ConversationDetail = {
@@ -62,6 +66,7 @@ export type AnswerMeta = {
   steps?: Step[];
   files?: FileRef[];
   sources?: SourceRef[];
+  partial?: boolean;
   /** Lampiran di pesan user. */
   attachments?: FileRef[];
 };
@@ -80,6 +85,7 @@ export function toThreadMessages(messages: StoredMessage[]): ThreadMessageLike[]
             files: m.files,
             steps: m.steps,
             sources: m.sources ?? [],
+            partial: m.partial,
           };
     // Pemikiran yang tersimpan dipasang lagi sebagai bagian "Pemikiran" di atas jawaban.
     const content = m.reasoning
@@ -100,6 +106,17 @@ export function toThreadMessages(messages: StoredMessage[]): ThreadMessageLike[]
 
 export function serverMessageId(message: ThreadMessage, questionIds: ReadonlyMap<string, number>) {
   return (message.metadata.custom as AnswerMeta | undefined)?.messageId ?? questionIds.get(message.id);
+}
+
+/** Isi dari server menggantikan jawaban lokal yang gagal. `null` kalau jawaban terakhir belum tersimpan. */
+export function reloadThreadMessages(
+  stored: StoredMessage[],
+  local: readonly ThreadMessage[],
+  questionIds: ReadonlyMap<string, number>,
+): ThreadMessageLike[] | null {
+  if (stored.at(-1)?.role !== "assistant") return null;
+  const kept = local.filter((message) => message.role === "user" || serverMessageId(message, questionIds) !== undefined);
+  return mergeThreadMessages(stored, kept, questionIds);
 }
 
 /** Sisipkan pesan lokal yang belum tersimpan setelah pesan server terakhir yang mendahuluinya. */
@@ -141,6 +158,11 @@ export function kindLabel(kind: string): string {
   if (kind === "txt" || kind === "md" || kind === "csv") return "Teks";
   if (["png", "jpg", "jpeg", "gif", "webp"].includes(kind)) return "Gambar";
   return "File";
+}
+
+/** Halaman PDF pertama yang dikutip, untuk gambar kecil di samping jawaban. */
+export function thumbnailSource(sources: readonly SourceRef[] | undefined): SourceRef | undefined {
+  return sources?.find((source) => source.kind === "pdf" && source.page !== null && !source.image);
 }
 
 /** Letak potongan di dokumen: "hal. 3" untuk PDF, "slide 3" untuk presentasi. */

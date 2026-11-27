@@ -68,7 +68,7 @@ pub fn read_xlsx_tool() -> Value {
     json!({
         "type": "function",
         "name": "read_xlsx",
-        "description": "Baca isi lampiran Excel (.xlsx atau .xls) atau file Excel buatan Bakase di percakapan ini. Sel rumus .xlsx menyertakan nilai tersimpan jika masih berlaku. Lampiran .xls hanya berisi nilai tersimpan. Hasilnya per halaman dengan nomor baris Excel; baris 1 adalah header. Kalau ada next_from_row, panggil lagi dengan from_row itu untuk halaman berikutnya.",
+        "description": "Baca baris tertentu dari lampiran Excel (.xlsx, .xlsm, .xls) atau file Excel buatan Bakase di percakapan ini. Untuk menyaring atau menghitung pakai hitung_xlsx, jangan membaca semua baris. Sel rumus .xlsx dan .xlsm menyertakan nilai tersimpan jika masih berlaku. Lampiran .xls hanya berisi nilai tersimpan. Hasilnya per halaman dengan nomor baris Excel; baris 1 adalah header. Kalau ada next_from_row, panggil lagi dengan from_row itu untuk halaman berikutnya.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -88,7 +88,7 @@ pub fn edit_xlsx_tool() -> Value {
     json!({
         "type": "function",
         "name": "edit_xlsx",
-        "description": "Ubah lampiran Excel (.xlsx atau .xls) atau file Excel buatan Bakase di percakapan ini. Server menerapkan perubahan ke isi lengkap file lalu membuat versi .xlsx baru. Format asli lampiran (warna, lebar kolom, gabungan sel, grafik) tidak ikut. Sampaikan peringatan rumus dari hasil tool kepada user. Pakai ini untuk mengubah file yang sudah ada, termasuk file besar. Baris 1 adalah header, data mulai baris 2. Rumus tidak menyesuaikan otomatis saat baris disisipkan atau dihapus, jadi perbarui rumus yang terdampak dengan set_cell.",
+        "description": "Ubah lampiran Excel (.xlsx, .xlsm, .xls) atau file Excel buatan Bakase di percakapan ini. Server menerapkan perubahan ke isi lengkap file lalu membuat versi .xlsx baru. Makro dan format asli lampiran (warna, lebar kolom, gabungan sel, grafik) tidak ikut. Sampaikan peringatan rumus dari hasil tool kepada user. Pakai ini untuk mengubah file yang sudah ada, termasuk file besar. Baris 1 adalah header, data mulai baris 2. Rumus tidak menyesuaikan otomatis saat baris disisipkan atau dihapus, jadi perbarui rumus yang terdampak dengan set_cell.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -465,6 +465,13 @@ fn normalize_formula(formula: &str) -> String {
 }
 
 pub fn build_xlsx(spec: &XlsxSpec) -> Result<Vec<u8>, String> {
+    build_xlsx_with_recalculation(spec, false)
+}
+
+pub(crate) fn build_xlsx_with_recalculation(
+    spec: &XlsxSpec,
+    pending: bool,
+) -> Result<Vec<u8>, String> {
     validate_xlsx(spec)?;
     let mut workbook = Workbook::new();
     let header = Format::new()
@@ -473,7 +480,8 @@ pub fn build_xlsx(spec: &XlsxSpec) -> Result<Vec<u8>, String> {
         .set_border_bottom(FormatBorder::Thin);
     for sheet in &spec.sheets {
         let ws = workbook.add_worksheet();
-        write_sheet(ws, sheet, &header).map_err(|e| format!("Sheet \"{}\": {e}", sheet.name))?;
+        write_sheet(ws, sheet, &header, pending)
+            .map_err(|e| format!("Sheet \"{}\": {e}", sheet.name))?;
     }
     workbook
         .save_to_buffer()
@@ -491,8 +499,11 @@ pub(crate) fn stored_formula(value: &Value) -> Option<&str> {
         .then_some(formula)
 }
 
-fn imported_formula(value: &Value, formula: &str) -> Formula {
+fn imported_formula(value: &Value, formula: &str, pending: bool) -> Formula {
     let formula = Formula::new(formula);
+    if pending {
+        return formula;
+    }
     match value
         .get("cache")
         .filter(|v| v.is_number())
@@ -508,8 +519,10 @@ fn write_sheet(
     ws: &mut Worksheet,
     sheet: &SheetSpec,
     header: &Format,
+    pending: bool,
 ) -> Result<(), rust_xlsxwriter::XlsxError> {
     ws.set_name(sheet.name.trim())?;
+    ws.set_formula_result_default("");
     let formats: Vec<Format> = sheet
         .columns
         .iter()
@@ -525,7 +538,12 @@ fn write_sheet(
             .as_ref()
             .and_then(|v| Some((v, stored_formula(v)?)))
         {
-            ws.write_formula_with_format(0, c16, imported_formula(value, formula), header)?;
+            ws.write_formula_with_format(
+                0,
+                c16,
+                imported_formula(value, formula, pending),
+                header,
+            )?;
         } else {
             ws.write_string_with_format(0, c16, &col.header, header)?;
         }
@@ -574,7 +592,12 @@ fn write_sheet(
                 },
                 other => {
                     let formula = stored_formula(other).expect("rumus sudah divalidasi");
-                    ws.write_formula_with_format(r32, c16, imported_formula(other, formula), fmt)?;
+                    ws.write_formula_with_format(
+                        r32,
+                        c16,
+                        imported_formula(other, formula, pending),
+                        fmt,
+                    )?;
                 }
             }
         }
@@ -634,7 +657,7 @@ pub fn column_letter(index: usize) -> String {
 }
 
 /// Alamat sel Excel ke (indeks kolom, nomor baris Excel): "B5" → (1, 5).
-fn parse_cell(address: &str) -> Option<(usize, usize)> {
+pub(crate) fn parse_cell(address: &str) -> Option<(usize, usize)> {
     let address = address.trim().replace('$', "");
     let split = address.find(|c: char| c.is_ascii_digit())?;
     let (letters, digits) = address.split_at(split);
@@ -708,16 +731,18 @@ fn same_sheet(a: &str, b: &str) -> bool {
 }
 
 fn sheet_mut<'a>(spec: &'a mut XlsxSpec, name: &str) -> Result<&'a mut SheetSpec, String> {
-    let names: Vec<String> = spec.sheets.iter().map(|s| s.name.clone()).collect();
-    spec.sheets
-        .iter_mut()
-        .find(|s| same_sheet(&s.name, name))
-        .ok_or_else(|| {
-            format!(
-                "sheet \"{name}\" tidak ada. Sheet yang ada: {}.",
-                names.join(", ")
-            )
-        })
+    let Some(index) = spec.sheets.iter().position(|s| same_sheet(&s.name, name)) else {
+        return Err(missing_sheet(spec, name));
+    };
+    Ok(&mut spec.sheets[index])
+}
+
+fn missing_sheet(spec: &XlsxSpec, name: &str) -> String {
+    let names: Vec<&str> = spec.sheets.iter().map(|s| s.name.as_str()).collect();
+    format!(
+        "sheet \"{name}\" tidak ada. Sheet yang ada: {}.",
+        names.join(", ")
+    )
 }
 
 /// Menerapkan perubahan ke isi lengkap file. Hasilnya tetap divalidasi oleh `build_xlsx`.
@@ -920,7 +945,7 @@ fn apply_edit(spec: &mut XlsxSpec, op: &EditOp) -> Result<(), String> {
 }
 
 /// Sel yang akan ditulis sebagai rumus (aturan yang sama dengan `as_formula`).
-fn is_formula_cell(sheet: &SheetSpec, col: usize, cell: &Value) -> bool {
+pub(crate) fn is_formula_cell(sheet: &SheetSpec, col: usize, cell: &Value) -> bool {
     if stored_formula(cell).is_some() {
         return true;
     }
@@ -930,7 +955,7 @@ fn is_formula_cell(sheet: &SheetSpec, col: usize, cell: &Value) -> bool {
     }
 }
 
-fn has_formulas(sheet: &SheetSpec) -> bool {
+pub(crate) fn has_formulas(sheet: &SheetSpec) -> bool {
     sheet.columns.iter().any(|col| col.header_formula.is_some())
         || sheet.rows.iter().any(|row| {
             row.iter()
@@ -1107,10 +1132,22 @@ fn used_in_sheet_range(formula: &str, name: &str) -> bool {
 /// dan jumlah baris), lalu baris sheet yang diminta mulai `from_row`, masing-masing dengan
 /// nomor baris Excel. Ringkasan dipadatkan kalau besar, dan halaman selalu maju walau satu
 /// baris lebih besar dari anggaran (isi sel panjang dipotong dan ditandai).
-pub fn read_page(spec: &XlsxSpec, sheet: Option<&str>, from_row: usize, budget: usize) -> Value {
-    let target_index = sheet
-        .and_then(|name| spec.sheets.iter().position(|s| same_sheet(&s.name, name)))
-        .unwrap_or(0);
+pub fn read_page(
+    spec: &XlsxSpec,
+    sheet: Option<&str>,
+    from_row: usize,
+    budget: usize,
+) -> Result<Value, String> {
+    // Hanya nama kosong yang berarti sheet pertama; nama yang salah tidak boleh diam-diam
+    // diganti, karena angka dari sheet lain bisa masuk jawaban.
+    let target_index = match sheet.map(str::trim).filter(|name| !name.is_empty()) {
+        None => 0,
+        Some(name) => spec
+            .sheets
+            .iter()
+            .position(|s| same_sheet(&s.name, name))
+            .ok_or_else(|| missing_sheet(spec, name))?,
+    };
     let columns_of = |s: &SheetSpec| -> Vec<Value> {
         s.columns
             .iter()
@@ -1157,7 +1194,7 @@ pub fn read_page(spec: &XlsxSpec, sheet: Option<&str>, from_row: usize, budget: 
         out["sheets"] = json!(names);
     }
     let Some(target) = spec.sheets.get(target_index) else {
-        return out;
+        return Ok(out);
     };
     let start = from_row.max(2) - 2;
     let mut used = out.to_string().len() + 300;
@@ -1181,7 +1218,7 @@ pub fn read_page(spec: &XlsxSpec, sheet: Option<&str>, from_row: usize, budget: 
         rows.push(item);
     }
     out["sheet"] = json!(target.name);
-    fit_page(out, rows, next, budget)
+    Ok(fit_page(out, rows, next, budget))
 }
 
 /// Menyusun halaman dan memastikan JSON akhirnya benar-benar muat di `budget`. Baris terakhir
@@ -1281,7 +1318,8 @@ impl FileStore {
         self.load(id).await.map(|(_, spec)| spec)
     }
 
-    /// Jenis file (`xlsx`, `docx`) dan isi terstrukturnya, dengan batasan yang sama.
+    /// Isi terstruktur untuk tool yang sudah memegang percakapan dari giliran yang sah.
+    /// Setelah transfer ke arsip, file tetap dapat dibaca oleh giliran pemilik asal.
     pub async fn load(&self, id: &str) -> Option<(String, Value)> {
         let FileStore::User {
             db,
@@ -1300,8 +1338,14 @@ impl FileStore {
             .call(move |c| {
                 use rusqlite::OptionalExtension;
                 Ok(c.query_row(
-                    "SELECT kind, spec FROM files WHERE id = ?1 AND user_id = ?2 AND conversation_id = ?3",
-                    rusqlite::params![id, user_id, conversation_id],
+                    "SELECT kind, spec FROM files
+                     WHERE id = ?1 AND conversation_id = ?3 AND (
+                         user_id = ?2 OR (user_id = ?4 AND EXISTS (
+                             SELECT 1 FROM archived_conversations
+                             WHERE conversation_id = ?3 AND original_user_id = ?2
+                         ))
+                     )",
+                    rusqlite::params![id, user_id, conversation_id, crate::archive::SYSTEM_ID],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?)
@@ -1314,28 +1358,57 @@ impl FileStore {
     }
 
     pub async fn load_for_excel_tools(&self, id: &str) -> Result<(String, Value), String> {
-        let (kind, mut spec) = self
+        let (kind, spec) = self
             .load(id)
             .await
             .ok_or("File tidak ditemukan di percakapan ini. Pakai id file dari riwayat.")?;
+        let spec = self.refresh_excel_upload(id, &kind, spec).await?;
+        Ok((kind, spec))
+    }
+
+    pub(crate) async fn refresh_excel_upload(
+        &self,
+        id: &str,
+        kind: &str,
+        spec: Value,
+    ) -> Result<Value, String> {
         let old_xlsx = kind == "xlsx" && spec.get("teks_rumus").is_none();
-        let old_xls = kind == "xls"
-            && spec["teks_rumus"]
-                .as_str()
-                .is_some_and(|text| !text.is_empty());
+        let old_xls = kind == "xls" && spec["xls_worksheet_values"] != true;
         if spec["lampiran"] == true && (old_xlsx || old_xls) {
-            // Perbarui hasil baca lampiran yang disimpan sebelum penanganan rumus berubah.
-            let FileStore::User { dir, user_id, .. } = self else {
-                unreachable!()
-            };
-            let bytes = tokio::fs::read(path_of(dir, *user_id, id, &kind))
-                .await
-                .map_err(|_| "File asli lampiran tidak bisa dibuka. Lampirkan ulang filenya.")?;
+            // Perbarui hasil baca lama dari sebelum perbaikan rumus dan grafik.
+            let bytes = self.read_excel_file(id, kind).await?;
             let name = spec["filename"].as_str().unwrap_or("Excel");
             let excel_kind = if old_xls { "xls" } else { "xlsx" };
-            spec = crate::attachments::read_content(excel_kind, name, &bytes).await?;
+            return crate::attachments::read_content(excel_kind, name, &bytes).await;
         }
-        Ok((kind, spec))
+        Ok(spec)
+    }
+
+    /// Hanya dipanggil sesudah `load` mengizinkan id ini di percakapan.
+    pub(crate) async fn read_excel_file(&self, id: &str, kind: &str) -> Result<Vec<u8>, String> {
+        let FileStore::User { dir, user_id, .. } = self else {
+            return Err("Lampiran Excel hanya tersedia di percakapan asal.".into());
+        };
+        if !valid_id(id) || !crate::documents::is_excel(kind) {
+            return Err("Pakai id lampiran Excel dari percakapan ini.".into());
+        }
+        use tokio::io::AsyncReadExt;
+        let error = |_| "File Excel tidak bisa dibuka. Lampirkan atau buat ulang filenya.";
+        let file = tokio::fs::File::open(path_of(dir, *user_id, id, kind))
+            .await
+            .map_err(error)?;
+        let max = crate::attachments::MAX_CALC_BYTES;
+        let mut bytes = Vec::new();
+        file.take(max as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(error)?;
+        if bytes.len() > max {
+            return Err(
+                "File Excel melewati batas 64 MiB. Pecah file dan hitung per bagian.".into(),
+            );
+        }
+        Ok(bytes)
     }
 
     pub async fn save(
@@ -1564,7 +1637,7 @@ pub async fn cleanup_orphans(db: Db, dir: PathBuf) {
             // Hanya file yang barisnya benar-benar terhapus yang dihapus dari disk: proses
             // server lain (saat deploy) bisa menautkan lampiran lama di antara dua perintah.
             let mut stmt = c.prepare(
-                "DELETE FROM files WHERE message_id IS NULL AND created_at < ?1
+                "DELETE FROM files WHERE message_id IS NULL AND conversation_id IS NULL AND created_at < ?1
                  RETURNING id, user_id, kind",
             )?;
             let rows = stmt
@@ -1590,6 +1663,19 @@ pub async fn cleanup_orphans(db: Db, dir: PathBuf) {
         }
         Err(e) => tracing::warn!("gagal membersihkan file yatim: {e:#}"),
     }
+    // Potongan unggahan berpotongan yang ditinggal lebih dari satu jam.
+    if let Ok(mut entries) = tokio::fs::read_dir(crate::attachments::parts_dir(&dir)).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let stale = entry
+                .metadata()
+                .await
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age.as_secs() > 60 * 60));
+            if stale {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
 }
 
 /// Path file di disk. `id` sudah dipastikan berasal dari baris milik user.
@@ -1605,6 +1691,7 @@ pub fn valid_id(id: &str) -> bool {
 pub fn mime_of(kind: &str) -> &'static str {
     match kind {
         "xlsx" => XLSX_MIME,
+        "xlsm" => "application/vnd.ms-excel.sheet.macroEnabled.12",
         "docx" => crate::docx::DOCX_MIME,
         "xls" => "application/vnd.ms-excel",
         "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -1669,6 +1756,65 @@ async fn owned_file(
         })
         .await?;
     row.ok_or_else(not_found)
+}
+
+/// Satu file di halaman File Saya.
+#[derive(Debug, Serialize)]
+pub struct MyFile {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub size: i64,
+    pub created_at: i64,
+    pub conversation_id: String,
+    pub conversation_title: String,
+    /// Diunggah user sebagai lampiran; selain itu dibuat Bakase.
+    pub upload: bool,
+}
+
+/// File terbaru yang ditampilkan di File Saya.
+const MY_FILES_LIMIT: i64 = 1000;
+
+/// `GET /api/files`: file di percakapan milik user, terbaru dulu. Lampiran yang belum dikirim
+/// dan percakapan yang sudah dipindah ke arsip tidak ikut. Lampiran tertaut ke pesan user,
+/// file buatan Bakase ke jawaban; kalau pesannya sudah tidak ada, tanda `lampiran` di isi
+/// file yang dipakai.
+pub async fn list(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> Result<Json<Vec<MyFile>>, ApiError> {
+    let rows = state
+        .db
+        .call(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT f.id, f.name, f.kind, f.size, f.created_at, c.id, c.title,
+                        CASE WHEN m.role IS NOT NULL THEN m.role = 'user'
+                             ELSE COALESCE(json_extract(f.spec, '$.lampiran'), 0) = 1 END
+                 FROM files f
+                 JOIN conversations c ON c.id = f.conversation_id AND c.user_id = f.user_id
+                 LEFT JOIN messages m ON m.id = f.message_id
+                 WHERE f.user_id = ?1 AND f.name <> ''
+                 ORDER BY f.created_at DESC, f.rowid DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![user.id, MY_FILES_LIMIT], |r| {
+                    Ok(MyFile {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        kind: r.get(2)?,
+                        size: r.get(3)?,
+                        created_at: r.get(4)?,
+                        conversation_id: r.get(5)?,
+                        conversation_title: r.get(6)?,
+                        upload: r.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    Ok(Json(rows))
 }
 
 pub async fn download(
@@ -1897,7 +2043,7 @@ mod tests {
         // Satu baris dengan sel raksasa tetap terbaca (dipotong) dan halaman maju.
         let mut spec = sample(3);
         spec.sheets[0].rows[0] = vec![json!("x".repeat(50_000)), json!(1)];
-        let page = read_page(&spec, None, 2, 5_000);
+        let page = read_page(&spec, None, 2, 5_000).unwrap();
         assert_eq!(page["rows"][0]["dipotong"], true);
         assert_eq!(page["next_from_row"], 3);
         assert!(page.to_string().len() < 8_000);
@@ -1910,7 +2056,7 @@ mod tests {
             .collect();
         let many: XlsxSpec =
             serde_json::from_value(json!({ "filename": "x", "sheets": sheets })).unwrap();
-        assert!(read_page(&many, None, 2, 20_000).to_string().len() < 20_000);
+        assert!(read_page(&many, None, 2, 20_000).unwrap().to_string().len() < 20_000);
     }
 
     #[test]
@@ -1957,7 +2103,7 @@ mod tests {
         let mut from = 2;
         let mut seen = Vec::new();
         for budget in [40_000, 38_560, 30_000, 10_000] {
-            let page = read_page(&spec, None, from, budget);
+            let page = read_page(&spec, None, from, budget).unwrap();
             assert!(
                 page.to_string().len() <= budget,
                 "halaman melebihi {budget}"
@@ -2032,18 +2178,19 @@ mod tests {
     #[test]
     fn large_files_are_read_in_pages() {
         let spec = sample(2000);
-        let page = read_page(&spec, None, 2, 5_000);
+        let page = read_page(&spec, None, 2, 5_000).unwrap();
         let rows = page["rows"].as_array().unwrap();
         assert!(!rows.is_empty() && rows.len() < 2000);
         assert_eq!(rows[0]["row"], 2);
         let next = page["next_from_row"].as_u64().unwrap() as usize;
         assert_eq!(next, rows.len() + 2);
-        let second = read_page(&spec, Some("data"), next, 5_000);
+        let second = read_page(&spec, Some("data"), next, 5_000).unwrap();
         assert_eq!(second["rows"][0]["row"], next);
         assert_eq!(page["sheets"][0]["data_rows"], 2000);
         assert_eq!(page["sheets"][0]["columns"][1]["col"], "B");
         assert!(
             read_page(&sample(3), None, 2, 40_000)
+                .unwrap()
                 .get("next_from_row")
                 .is_none()
         );
@@ -2052,6 +2199,16 @@ mod tests {
         assert_eq!(column_index("zzz"), Some(18_277));
         assert_eq!(column_letter(usize::from(u16::MAX)), "");
         assert_eq!(parse_cell("$AB$12"), Some((27, 12)));
+    }
+
+    #[test]
+    fn unknown_sheet_is_an_error_instead_of_the_first_sheet() {
+        let spec = sample(3);
+        let error = read_page(&spec, Some("Rekap"), 2, 5_000).unwrap_err();
+        assert!(error.contains("\"Rekap\" tidak ada"), "{error}");
+        assert!(error.contains(&spec.sheets[0].name), "{error}");
+        let page = read_page(&spec, Some("  "), 2, 5_000).unwrap();
+        assert_eq!(page["sheet"], json!(spec.sheets[0].name));
     }
 
     #[test]

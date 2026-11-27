@@ -6,7 +6,7 @@
 // (`[auth] extension_ids`). Halaman lain tidak bisa memasang Bakase di iframe (CSP
 // frame-ancestors), jadi tidak ada pihak lain yang bisa ikut menjawab.
 import { allowedOrigin, readProgress, readReply, type PageRead } from "./pageRead.ts";
-import { pageActionTiming, readActionReply, type ActionReply, type PageAction } from "./pageAction.ts";
+import { pageActionTiming, readActionReply, readTableProgress, type ActionReply, type PageAction } from "./pageAction.ts";
 import { createPageSession, pageChanged, type LivePage } from "./pageSession.ts";
 
 const TIMEOUT_MS = 120_000;
@@ -97,7 +97,7 @@ export function requestPage(
       if ("error" in reply) reject(new Error(reply.error));
       else {
         const { page } = reply;
-        if (page.snapshotId) session.remember(page.snapshotId, origin);
+        if (page.snapshotId) session.remember(page.snapshotId, origin, page.ambilTabel);
         resolve(page);
       }
     };
@@ -112,7 +112,8 @@ export function requestPage(
 
 function askPanel(page: LivePage, action: PageAction, signal: AbortSignal): Promise<ActionReply> {
   const { id } = action;
-  const { timeout, deadline } = pageActionTiming(action.remaining_ms);
+  if (action.action === "ambil_tabel" && !page.ambilTabel) return Promise.resolve({ status: "unavailable" });
+  const { timeout, deadline } = pageActionTiming(action);
   const remaining_ms = Math.min(timeout, deadline - performance.now());
   if (remaining_ms <= 0) {
     releasePage(page);
@@ -138,8 +139,15 @@ function askPanel(page: LivePage, action: PageAction, signal: AbortSignal): Prom
         finish({ status: "unavailable" });
         return;
       }
+      if (action.action === "ambil_tabel") {
+        const progress = readTableProgress(event.data, id);
+        if (progress !== null) {
+          void postAction(id, { progress }, signal).catch(() => {});
+          return;
+        }
+      }
       const reply = readActionReply(event.data, id);
-      if (reply) finish(reply);
+      if (reply) finish(reply.status === "table" && action.action !== "ambil_tabel" ? { status: "failed" } : reply);
     }
     const timer = setTimeout(() => stop("timeout"), remaining_ms);
     signal.addEventListener("abort", cancel, { once: true });
@@ -148,18 +156,18 @@ function askPanel(page: LivePage, action: PageAction, signal: AbortSignal): Prom
   });
 }
 
-async function postReply(id: string, reply: ActionReply, signal: AbortSignal) {
+async function postAction(id: string, data: { reply: ActionReply } | { progress: number }, signal: AbortSignal) {
   const res = await fetch("/api/chat/page-action", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id, reply }),
+    body: JSON.stringify({ id, ...data }),
     signal,
   });
   if (!res.ok) throw new Error("Hasil aksi halaman tidak diterima server.");
 }
 
 export function answerPageAction(page: LivePage, action: PageAction, signal: AbortSignal) {
-  return session.answer(page, action, signal, askPanel, postReply).catch((err: unknown) => {
+  return session.answer(page, action, signal, askPanel, (id, reply, signal) => postAction(id, { reply }, signal)).catch((err: unknown) => {
     releasePage(page);
     throw err;
   });

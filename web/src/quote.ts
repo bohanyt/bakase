@@ -149,6 +149,18 @@ export function rangeBounds(a: CellPos, b: CellPos) {
   };
 }
 
+/**
+ * Langkah gulir per frame saat seret memilih sel mendekati atau melewati tepi area tabel
+ * yang terlihat (`start` sampai `end`). Makin jauh lewat tepi, makin cepat. Zona di dalam
+ * tepi perlu ada karena tepi panel sering menempel di tepi layar.
+ */
+export function edgeScrollStep(pos: number, start: number, end: number, zone = 24, max = 24): number {
+  const edge = Math.max(4, Math.min(zone, Math.floor((end - start) / 4)));
+  if (pos < start + edge) return -Math.min(max, Math.ceil((start + edge - pos) / 6));
+  if (pos > end - edge) return Math.min(max, Math.ceil((pos - (end - edge)) / 6));
+  return 0;
+}
+
 /** `Data!B2:D5`, atau `Data!B2` untuk satu sel. */
 export function rangeA1(sheet: string | null, a: CellPos, b: CellPos): string {
   const { top, bottom, left, right } = rangeBounds(a, b);

@@ -50,6 +50,9 @@ pub struct StoredMessage {
     steps: serde_json::Value,
     /// Potongan dokumen yang dikutip jawaban ini, hanya yang masih boleh dibaca user.
     sources: Vec<SourceRef>,
+    /// Jawaban berhenti sebelum selesai.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    partial: bool,
 }
 
 /// Bagian jawaban selain teks: ringkasan pemikiran dan langkah tool.
@@ -61,6 +64,7 @@ pub struct AnswerExtras {
     pub file_ids: Vec<String>,
     /// Potongan dokumen yang dikutip jawaban.
     pub sources: Vec<SourceRef>,
+    pub partial: bool,
 }
 
 #[derive(Serialize)]
@@ -209,7 +213,7 @@ pub async fn get(
             };
             let mut stmt = c.prepare(
                 "SELECT m.id, m.role, m.content, m.created_at, m.duration_ms, f.rating,
-                        m.reasoning, m.steps, m.sources
+                        m.reasoning, m.steps, m.sources, m.partial
                  FROM messages m
                  LEFT JOIN feedback f ON f.message_id = m.id AND f.user_id = ?2
                  WHERE m.conversation_id = ?1 ORDER BY m.id",
@@ -231,10 +235,11 @@ pub async fn get(
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_else(|| serde_json::json!([])),
                         sources,
+                        partial: r.get(9)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut by_message = files_by_message(c, &id)?;
+            let mut by_message = files_by_message(c, &id, None)?;
             for m in &mut messages {
                 m.files = by_message.remove(&m.id).unwrap_or_default();
             }
@@ -250,6 +255,14 @@ pub async fn get(
         .ok_or_else(not_found)?;
     let mut lists: Vec<_> = detail.messages.iter_mut().map(|m| &mut m.sources).collect();
     let revoked = keep_readable(state.as_ref(), Some(user), &mut lists, history_deadline()).await?;
+    if let Some(index) = &state.docs {
+        crate::scan::refresh_citations(
+            &state.db,
+            index.table(),
+            lists.iter_mut().flat_map(|sources| sources.iter_mut()),
+        )
+        .await?;
+    }
     let mut first_revoked = None;
     for (message, access) in detail.messages.iter_mut().zip(revoked) {
         if access.revoked {
@@ -553,6 +566,9 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Untuk model, supaya "lanjutkan" tidak dianggap meneruskan jawaban yang sudah utuh.
+const PARTIAL_NOTE: &str = "\n\n[Jawaban ini berhenti sebelum selesai.]";
+
 /// Hasil menyiapkan satu giliran chat.
 pub struct Turn {
     pub id: String,
@@ -563,11 +579,49 @@ pub struct Turn {
     pub message_ids: Vec<i64>,
     pub summary: Option<crate::compaction::Summary>,
     pub first_revoked: Option<i64>,
+    pub trace: crate::turn_trace::Turn,
 }
 
-/// Membuat percakapan baru atau memastikan percakapan milik user, menyimpan pesan user
-/// beserta lampirannya, lalu mengembalikan seluruh riwayat untuk dikirim ke model.
-/// Kalau lampiran tidak valid, tidak ada yang tersimpan.
+/// Pertanyaan yang sudah tersimpan dengan kunci giliran yang sama.
+pub struct KnownTurn {
+    pub id: String,
+    pub title: String,
+    pub question_id: i64,
+}
+
+fn turn_key(user_id: i64, turn_id: &str) -> String {
+    format!("{user_id}:{turn_id}")
+}
+
+/// Kiriman ulang dari browser yang tidak sempat menerima balasan pertama.
+pub async fn known_turn(
+    state: &AppState,
+    user_id: i64,
+    turn_id: &str,
+) -> Result<Option<KnownTurn>, ApiError> {
+    let key = turn_key(user_id, turn_id);
+    Ok(state
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT c.id, c.title, m.id FROM messages m
+                 JOIN conversations c ON c.id = m.conversation_id
+                 WHERE m.turn_key = ?1 AND c.user_id = ?2",
+                params![key, user_id],
+                |r| {
+                    Ok(KnownTurn {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        question_id: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+        })
+        .await?)
+}
+
+#[cfg(test)]
 pub async fn begin_turn(
     state: &AppState,
     user_id: i64,
@@ -575,6 +629,31 @@ pub async fn begin_turn(
     message: String,
     attachment_ids: Vec<String>,
 ) -> Result<Turn, ApiError> {
+    begin_keyed_turn(
+        state,
+        user_id,
+        conversation_id,
+        message,
+        attachment_ids,
+        None,
+    )
+    .await
+}
+
+/// Membuat percakapan baru atau memastikan percakapan milik user, menyimpan pesan user
+/// beserta lampirannya, lalu mengembalikan seluruh riwayat untuk dikirim ke model.
+/// Kalau lampiran tidak valid, tidak ada yang tersimpan.
+pub async fn begin_keyed_turn(
+    state: &AppState,
+    user_id: i64,
+    conversation_id: Option<String>,
+    message: String,
+    attachment_ids: Vec<String>,
+    turn_id: Option<&str>,
+) -> Result<Turn, ApiError> {
+    let turn_key = turn_id.map(|turn_id| turn_key(user_id, turn_id));
+    let traces = state.traces.clone();
+    let deployment = state.llm.deployment().to_owned();
     let prepared = state
         .db
         .call(move |c| {
@@ -587,7 +666,7 @@ pub async fn begin_turn(
             let (id, title) = match conversation_id {
                 Some(id) => {
                     let Some(title) = owned(&tx, &id, user_id)? else {
-                        return Ok(Err(not_found()));
+                        return Ok(Err(ApiError::not_found("Percakapan tidak ditemukan atau sudah diarsipkan.")));
                     };
                     (id, title)
                 }
@@ -608,8 +687,8 @@ pub async fn begin_turn(
                 }
             };
             tx.execute(
-                "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?1, 'user', ?2, ?3)",
-                params![id, message, now],
+                "INSERT INTO messages (conversation_id, role, content, created_at, turn_key) VALUES (?1, 'user', ?2, ?3, ?4)",
+                params![id, message, now, turn_key],
             )?;
             let question_id = tx.last_insert_rowid();
             crate::attachments::bind(&tx, user_id, &attachment_ids, &id, question_id, now)?;
@@ -617,19 +696,23 @@ pub async fn begin_turn(
                 "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
                 params![now, id],
             )?;
+            let mut sheet_notes = HashMap::new();
             let rows = {
                 // Jawaban yang membuat file diberi catatan nama dan id file, supaya model
                 // bisa membacanya lagi dengan read_xlsx saat diminta mengubah. Pesan user
                 // yang membawa lampiran diberi catatan yang sama. Jawaban yang mengutip
                 // dokumen diberi daftar sumbernya, supaya nomor [n] tetap jelas.
                 let mut stmt = tx.prepare(
-                    "SELECT m.id, m.role, m.content, m.sources
+                    "SELECT m.id, m.role, m.content, m.sources, m.partial
                      FROM messages m WHERE m.conversation_id = ?1 ORDER BY m.id",
                 )?;
-                let mut by_message = files_by_message(&tx, &id)?;
+                let mut by_message = files_by_message(&tx, &id, Some(&mut sheet_notes))?;
                 stmt
                     .query_map(params![id], |r| {
-                        let (content, sources) = stored_answer(r.get(2)?, r.get(3)?);
+                        let (mut content, sources) = stored_answer(r.get(2)?, r.get(3)?);
+                        if r.get(4)? {
+                            content.push_str(PARTIAL_NOTE);
+                        }
                         let message_id = r.get(0)?;
                         Ok((
                             message_id,
@@ -644,10 +727,11 @@ pub async fn begin_turn(
             let reader = acl_user(&tx, user_id)?;
             let summary = crate::compaction::load(&tx, &id)?;
             tx.commit()?;
-            Ok(Ok((id, question_id, title, reader, rows, summary)))
+            let trace = traces.start(question_id, &deployment);
+            Ok(Ok((id, question_id, title, reader, rows, sheet_notes, summary, trace)))
         })
         .await??;
-    let (id, question_id, title, reader, mut rows, summary) = prepared;
+    let (id, question_id, title, reader, mut rows, sheet_notes, summary, trace) = prepared;
     let mut lists: Vec<_> = rows.iter_mut().map(|row| &mut row.4).collect();
     let revoked = keep_readable(state, reader, &mut lists, history_deadline()).await?;
     let mut first_revoked = None;
@@ -660,6 +744,14 @@ pub async fn begin_turn(
             files.clear();
         }
     }
+    if let Some(index) = &state.docs {
+        crate::scan::refresh_citations(
+            &state.db,
+            index.table(),
+            rows.iter_mut().flat_map(|row| row.4.iter_mut()),
+        )
+        .await?;
+    }
     let message_ids = rows.iter().map(|row| row.0).collect();
     let history = rows
         .into_iter()
@@ -669,7 +761,7 @@ pub async fn begin_turn(
                 if !content.is_empty() {
                     content.push_str("\n\n");
                 }
-                content.push_str(&crate::attachments::history_note(&files));
+                content.push_str(&crate::attachments::history_note(&files, &sheet_notes));
                 attachments = files;
             } else if !files.is_empty() {
                 let list: Vec<String> = files
@@ -697,6 +789,7 @@ pub async fn begin_turn(
         message_ids,
         summary,
         first_revoked,
+        trace,
     })
 }
 
@@ -704,13 +797,19 @@ pub async fn begin_turn(
 fn files_by_message(
     c: &Connection,
     conversation_id: &str,
+    mut sheet_notes: Option<&mut HashMap<String, crate::attachments::FileNote>>,
 ) -> rusqlite::Result<HashMap<i64, Vec<FileRef>>> {
     let mut stmt = c.prepare(
-        "SELECT id, name, kind, size, message_id FROM files
+        "SELECT id, name, kind, size, message_id,
+            CASE WHEN ?2 AND kind IN ('xlsx', 'xls') AND json_valid(spec)
+                 THEN json_extract(spec, '$.sheet_note') END,
+            CASE WHEN ?2 AND instr(spec, '\"fokus\":') > 0 AND json_valid(spec)
+                 THEN json_extract(spec, '$.fokus') END
+         FROM files
          WHERE conversation_id = ?1 AND message_id IS NOT NULL ORDER BY created_at, rowid",
     )?;
     let mut by_message: HashMap<i64, Vec<FileRef>> = HashMap::new();
-    for row in stmt.query_map(params![conversation_id], |r| {
+    for row in stmt.query_map(params![conversation_id, sheet_notes.is_some()], |r| {
         Ok((
             r.get::<_, i64>(4)?,
             FileRef {
@@ -719,9 +818,22 @@ fn files_by_message(
                 kind: r.get(2)?,
                 size: r.get(3)?,
             },
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<String>>(6)?,
         ))
     })? {
-        let (message_id, file) = row?;
+        let (message_id, file, sheets, focus) = row?;
+        if let Some(notes) = sheet_notes.as_deref_mut()
+            && (sheets.is_some() || focus.is_some())
+        {
+            notes.insert(
+                file.id.clone(),
+                crate::attachments::FileNote {
+                    sheets: sheets.unwrap_or_default(),
+                    focus: focus.unwrap_or_default(),
+                },
+            );
+        }
         by_message.entry(message_id).or_default().push(file);
     }
     Ok(by_message)
@@ -753,7 +865,7 @@ fn parse_sources(json: Option<String>) -> Vec<SourceRef> {
 /// Role dan departemen user saat ini, untuk mengecek hak akses dokumen.
 fn acl_user(c: &Connection, user_id: i64) -> rusqlite::Result<Option<AuthUser>> {
     c.query_row(
-        "SELECT role, department FROM users WHERE id = ?1 AND status = 'active'",
+        "SELECT role, departments FROM users_with_access WHERE id = ?1 AND status = 'active'",
         [user_id],
         |r| {
             let role: String = r.get(0)?;
@@ -761,7 +873,7 @@ fn acl_user(c: &Connection, user_id: i64) -> rusqlite::Result<Option<AuthUser>> 
                 id: user_id,
                 email: String::new(),
                 name: String::new(),
-                department: r.get(1)?,
+                departments: crate::access::from_row(r, 1)?,
                 role: Role::parse(&role).unwrap_or(Role::User),
             })
         },
@@ -1011,8 +1123,13 @@ fn sources_note(sources: &[SourceRef]) -> String {
                 s.page.map(|p| format!(", hal. {p}")).unwrap_or_default()
             };
             format!(
-                "[{}] {} ({}{place}, dokumen {}, sitasi {})",
-                s.n, s.title, s.source, s.doc_id, s.chunk_id
+                "[{}] {} ({}{place}{}, dokumen {}, sitasi {})",
+                s.n,
+                s.title,
+                s.source,
+                crate::scan::note(s.scan, s.handwriting.as_ref()),
+                s.doc_id,
+                s.chunk_id
             )
         })
         .collect();
@@ -1049,9 +1166,9 @@ pub async fn save_answer(
             let now = now();
             let tx = c.transaction()?;
             let n = tx.execute(
-                "INSERT INTO messages (conversation_id, role, content, created_at, duration_ms, reply_to, reasoning, steps, sources)
-                 SELECT ?1, 'assistant', ?2, ?3, ?4, ?5, ?6, ?7, ?8 WHERE EXISTS (SELECT 1 FROM conversations WHERE id = ?1)",
-                params![conversation_id, content, now, duration_ms, question_id, reasoning, steps, sources],
+                "INSERT INTO messages (conversation_id, role, content, created_at, duration_ms, reply_to, reasoning, steps, sources, partial)
+                 SELECT ?1, 'assistant', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 WHERE EXISTS (SELECT 1 FROM conversations WHERE id = ?1)",
+                params![conversation_id, content, now, duration_ms, question_id, reasoning, steps, sources, extras.partial],
             )?;
             let id = (n == 1).then(|| tx.last_insert_rowid());
             if let Some(message_id) = id {

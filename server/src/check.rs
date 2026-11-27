@@ -6,6 +6,7 @@
 
 use crate::agent::{function_calls, output_text};
 use crate::llm::Llm;
+use crate::usage::Usage;
 use base64::Engine;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ const TEST_IMAGE: &[u8] = include_bytes!("../assets/cek-vision.png");
 const TEST_CODE: &str = "4821";
 const TEST_STOCK: &str = "120";
 
-pub async fn run(llm: &Llm) -> anyhow::Result<()> {
+pub async fn run(llm: &Llm, usage: &mut Usage) -> anyhow::Result<()> {
     let mut failed = 0;
     let mut report = |label: &str, ok: bool, detail: String| {
         if !ok {
@@ -34,7 +35,7 @@ pub async fn run(llm: &Llm) -> anyhow::Result<()> {
         { "type": "input_image", "image_url": format!("data:image/png;base64,{image}") },
     ]}]);
     let started = Instant::now();
-    match llm.respond(input, json!({})).await {
+    match ask(llm, input, json!({}), usage).await {
         Ok(r) => {
             let text = output_text(&r);
             let tokens = r["usage"]["input_tokens"].as_u64().unwrap_or(0);
@@ -61,7 +62,7 @@ pub async fn run(llm: &Llm) -> anyhow::Result<()> {
         { "type": "input_file", "filename": "cek-vision.pdf", "file_data": format!("data:application/pdf;base64,{pdf}") },
     ]}]);
     let started = Instant::now();
-    match llm.respond(input, json!({})).await {
+    match ask(llm, input, json!({}), usage).await {
         Ok(r) => {
             let text = output_text(&r);
             let tokens = r["usage"]["input_tokens"].as_u64().unwrap_or(0);
@@ -93,16 +94,17 @@ pub async fn run(llm: &Llm) -> anyhow::Result<()> {
     let started = Instant::now();
     // Tool dipaksa di giliran pertama, supaya yang diuji kemampuan deployment, bukan
     // keputusan model; panggilan paralel dimatikan.
-    let first = llm
-        .respond(
-            json!([question]),
-            json!({
-                "tools": [tool],
-                "tool_choice": { "type": "function", "name": "cek_stok_produk" },
-                "parallel_tool_calls": false,
-            }),
-        )
-        .await;
+    let first = ask(
+        llm,
+        json!([question]),
+        json!({
+            "tools": [tool],
+            "tool_choice": { "type": "function", "name": "cek_stok_produk" },
+            "parallel_tool_calls": false,
+        }),
+        usage,
+    )
+    .await;
     match first {
         Ok(r) => match function_calls(&r).into_iter().next() {
             Some(call) => {
@@ -129,12 +131,13 @@ pub async fn run(llm: &Llm) -> anyhow::Result<()> {
                     }));
                 }
                 let started = Instant::now();
-                match llm
-                    .respond(
-                        Value::Array(input),
-                        json!({ "tools": [tool], "tool_choice": "none" }),
-                    )
-                    .await
+                match ask(
+                    llm,
+                    Value::Array(input),
+                    json!({ "tools": [tool], "tool_choice": "none" }),
+                    usage,
+                )
+                .await
                 {
                     Ok(r) => {
                         let text = output_text(&r);
@@ -165,13 +168,23 @@ pub async fn run(llm: &Llm) -> anyhow::Result<()> {
         "name": tool["name"], "description": tool["description"], "parameters": tool["parameters"],
     }}]);
     let started = Instant::now();
-    let info = match llm
+    let chat = llm
         .complete(
             json!([question]),
             json!({ "tools": chat_tool, "reasoning_effort": "none" }),
         )
-        .await
-    {
+        .await;
+    if let Ok(r) = &chat {
+        // Chat Completions memakai nama field lain untuk angka yang sama.
+        usage.start_request();
+        usage.add_response(&json!({ "usage": {
+            "input_tokens": r["usage"]["prompt_tokens"],
+            "input_tokens_details": r["usage"]["prompt_tokens_details"],
+            "output_tokens": r["usage"]["completion_tokens"],
+            "output_tokens_details": r["usage"]["completion_tokens_details"],
+        }}));
+    }
+    let info = match chat {
         Ok(r) if r["choices"][0]["message"]["tool_calls"][0]["function"]["name"].is_string() => {
             format!("BISA · {}", secs(started.elapsed()))
         }
@@ -189,8 +202,8 @@ pub async fn run(llm: &Llm) -> anyhow::Result<()> {
         "produk contoh tersedia dalam berbagai ukuran dan ketebalan untuk konstruksi dan industri. "
             .repeat(90);
     let long = json!([{ "role": "user", "content": format!("{filler}\nJawab satu kata: apa bahan produknya?") }]);
-    let info = match llm.respond(long.clone(), json!({})).await {
-        Ok(_) => match llm.respond(long, json!({})).await {
+    let info = match ask(llm, long.clone(), json!({}), usage).await {
+        Ok(_) => match ask(llm, long, json!({}), usage).await {
             Ok(r) => {
                 let total = r["usage"]["input_tokens"].as_u64().unwrap_or(0);
                 let cached = r["usage"]["input_tokens_details"]["cached_tokens"]
@@ -207,6 +220,14 @@ pub async fn run(llm: &Llm) -> anyhow::Result<()> {
 
     anyhow::ensure!(failed == 0, "{failed} cek tidak lulus");
     Ok(())
+}
+
+/// Tokennya dihitung juga kalau isi jawabannya tidak lulus cek.
+async fn ask(llm: &Llm, input: Value, extra: Value, usage: &mut Usage) -> anyhow::Result<Value> {
+    let response = llm.respond(input, extra).await?;
+    usage.start_request();
+    usage.add_response(&response);
+    Ok(response)
 }
 
 fn secs(d: Duration) -> String {

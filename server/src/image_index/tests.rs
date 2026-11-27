@@ -258,28 +258,31 @@ model = "model"
 [[sources]]
 name = "Dokumen Uji"
 path = "sumber"
-visibility = { type = "departemen", departments = ["Review"] }
+visibility = { type = "admin" }
 "#,
     )
     .unwrap();
-    let cfg = Config::load(&config).unwrap();
-    let root = &cfg.sources[0].path;
-    fs::create_dir(root).unwrap();
+    let restricted = Config::load(&config).unwrap();
+    let mut cfg = restricted.clone();
+    let root = cfg.sources[0].path.clone();
+    fs::create_dir(&root).unwrap();
     let name = "uji.png";
     let path = root.join(name);
     RgbImage::from_pixel(128, 128, image::Rgb([20, 40, 60]))
         .save(&path)
         .unwrap();
-    ingest::run(&cfg, false, None).await.unwrap();
+    fs::write(root.join("contoh.txt"), "Torsi sintetis Contoh").unwrap();
+    ingest::run(&restricted, false, None).await.unwrap();
+    cfg.sources[0].visibility = Visibility::Departemen(vec!["Contoh".into()]);
     assert_eq!(targets(&cfg).unwrap().len(), 1);
     let db = Db::open_read_only(&cfg.data_dir).unwrap();
     let id: i64 = db
         .call(|conn| {
-            Ok(
-                conn.query_row(&format!("SELECT id FROM {INDEX_TABLE}"), [], |row| {
-                    row.get(0)
-                })?,
-            )
+            Ok(conn.query_row(
+                &format!("SELECT id FROM {INDEX_TABLE} WHERE rel_path = 'uji.png'"),
+                [],
+                |row| row.get(0),
+            )?)
         })
         .await
         .unwrap();
@@ -305,7 +308,7 @@ visibility = { type = "departemen", departments = ["Review"] }
         email: "uji@example.test".into(),
         name: "Uji".into(),
         role: Role::User,
-        department: Some("Operasional".into()),
+        departments: vec!["Operasional".into()],
     };
     assert!(
         for_document(&cfg, &db, &index, &user, id)
@@ -313,13 +316,41 @@ visibility = { type = "departemen", departments = ["Review"] }
             .unwrap()
             .is_empty()
     );
-    user.department = Some("Review".into());
+    user.departments.push("Contoh".into());
+    let assert_index_access = |expected_count| {
+        let names = ["Dokumen Uji".to_string()];
+        assert_eq!(
+            index
+                .search("torsi", &user, &names, 0, 10, false)
+                .unwrap()
+                .len(),
+            expected_count
+        );
+        let snapshot = index.snapshot();
+        let (allowed, _) = index
+            .semantic_addresses(
+                &snapshot,
+                &user,
+                &names,
+                &crate::search::SearchFilters::default(),
+            )
+            .unwrap();
+        assert_eq!(allowed.len(), expected_count * 2);
+    };
+    assert_index_access(0);
+    assert!(
+        for_document(&cfg, &db, &index, &user, id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(ingest::run(&cfg, false, None).await.unwrap().read, 2);
+    index.reload().unwrap();
+    assert_index_access(1);
     let allowed = for_document(&cfg, &db, &index, &user, id).await.unwrap();
     assert_eq!(allowed.len(), 1);
     assert_eq!(allowed[0].location, "");
     assert_eq!(allowed[0].vector.len(), eg2::DIM);
-    let mut restricted = cfg.clone();
-    restricted.sources[0].visibility = Visibility::Admin;
     assert!(
         for_document(&restricted, &db, &index, &user, id)
             .await
@@ -348,7 +379,7 @@ visibility = { type = "departemen", departments = ["Review"] }
         .unwrap();
     let mut public_cfg = cfg.clone();
     public_cfg.sources[0].visibility = Visibility::Umum;
-    user.department = Some("Operasional".into());
+    user.departments = vec!["Operasional".into()];
     assert!(
         for_document(&public_cfg, &db, &index, &user, id)
             .await
@@ -365,7 +396,7 @@ visibility = { type = "departemen", departments = ["Review"] }
         })
         .await
         .unwrap();
-    user.department = Some("Review".into());
+    user.departments = vec!["Contoh".into()];
     assert!(
         for_document(&cfg, &db, &index, &user, id)
             .await
@@ -399,7 +430,7 @@ visibility = { type = "departemen", departments = ["Review"] }
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn same_image_hash_does_not_reveal_a_private_reference_or_thumbnail() {
     use axum::{
         body::Body,
@@ -410,6 +441,13 @@ async fn same_image_hash_does_not_reveal_a_private_reference_or_thumbnail() {
     use serde_json::{Value, json};
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    // Database replies arrive from outside Tokio. Keep the paused clock from
+    // advancing to a request deadline while a reply is in flight.
+    let (_hold_clock, release_clock) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        let _ = release_clock.recv();
+    });
 
     struct SyntheticText(Vec<f32>);
     impl crate::embed::Embedder for SyntheticText {
@@ -613,15 +651,29 @@ visibility = { type = "departemen", departments = ["Review"] }
         serde_json::from_slice(&search.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(result[0]["snippet"], "Ringkasan rahasia sintetis.");
     db.call(move |c| {
-        c.execute(
-            "UPDATE users SET department = 'Umum' WHERE id = ?",
-            [user_id],
-        )?;
+        let tx = c.transaction()?;
+        crate::access::replace(&tx, user_id, &["Umum".into()])?;
+        tx.commit()?;
         Ok(())
     })
     .await
     .unwrap();
+    let login = request(
+        "/api/auth/login".into(),
+        String::new(),
+        Some(json!({"email": "uji-gambar@example.com", "password": crate::tests::ACTIVE_USER_PW})),
+    )
+    .await;
+    assert_eq!(login.status(), StatusCode::OK);
+    let review = login.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
     let blocked = request(detail, review.clone(), None).await;
+    assert_eq!(blocked.status(), StatusCode::OK);
     let blocked = blocked.into_body().collect().await.unwrap().to_bytes();
     let blocked = String::from_utf8_lossy(&blocked);
     assert!(!blocked.contains("Ringkasan rahasia sintetis."));
@@ -708,7 +760,7 @@ async fn mock_vision_with_images(
         email: "uji@example.test".into(),
         name: "Uji".into(),
         role: Role::User,
-        department: Some("Review".into()),
+        departments: vec!["Review".into()],
     };
     let context = agent::ToolContext {
         files: FileStore::Local {
@@ -721,6 +773,7 @@ async fn mock_vision_with_images(
             index: state.docs.as_ref().unwrap().clone(),
             sources: state.sources.clone(),
             user: user.clone(),
+            session: None,
         }),
     };
     let page_request = serde_json::from_value(json!({
@@ -743,6 +796,7 @@ async fn mock_vision_with_images(
             &context,
             &send,
             Some(page_turn),
+            &mut crate::turn_trace::Turn::default(),
         )
         .await
     };

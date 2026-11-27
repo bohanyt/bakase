@@ -218,6 +218,7 @@ async fn read_events(res: axum::response::Response) -> Vec<(String, Value)> {
 async fn chat_compacts_at_seventy_percent_and_reuses_persisted_summary() {
     let mut state = app_state();
     let vision = Mockmodel::start(&mut state, false).await;
+    Arc::get_mut(&mut state).unwrap().traces = turn_trace::Store::in_memory(state.db.clone());
     let app = router(state.clone());
     let admin = admin_cookie(&app).await;
     let (user, cookie) = active_user(&app, &admin, "ringkasan@example.com").await;
@@ -240,6 +241,16 @@ async fn chat_compacts_at_seventy_percent_and_reuses_persisted_summary() {
     assert_eq!(before[0]["input"][0]["content"], "Target awal");
 
     let over = chat_events(&app, &cookie, &id, "z".repeat(700)).await;
+    let question = over[0].1["question_id"].as_i64().unwrap();
+    state.traces.flush().await;
+    let trace = state
+        .db
+        .call(move |c| super::chat_trace::read_question(c, question))
+        .await
+        .unwrap();
+    assert_eq!(trace["entries"][0]["phase"], "compaction");
+    assert_eq!(trace["entries"][0]["text"], RECAP);
+    assert_eq!(trace["entries"][1]["phase"], "answer");
     assert_eq!(
         over[1],
         (
@@ -525,7 +536,7 @@ async fn third_stage_timeout_reuses_two_saved_stages_on_the_next_attempt() {
 }
 
 #[tokio::test]
-async fn concurrent_tabs_reuse_the_summary_after_waiting_for_its_lock() {
+async fn a_second_tab_waits_for_the_first_and_reuses_its_summary() {
     let mut state = app_state();
     let gate = Arc::new(SummaryGate::default());
     let vision = Mockmodel::start_with_gate(&mut state, false, Some(gate.clone())).await;
@@ -536,17 +547,15 @@ async fn concurrent_tabs_reuse_the_summary_after_waiting_for_its_lock() {
         seed_turn(&state, user, None, "Target awal", "x".repeat(5100), vec![]).await;
     let first = chat_response(&app, &cookie, &id, "y".repeat(700)).await;
     gate.received.notified().await;
-    let second = chat_response(&app, &cookie, &id, "Lanjut dari tab kedua".into()).await;
-    gate.release.notify_one();
-    let (first, second) = tokio::join!(read_events(first), read_events(second));
+    let second = chat_response(&app, &cookie, &id, "Lanjut dari tab kedua".into());
+    let (second, first) = tokio::join!(second, async {
+        gate.release.notify_one();
+        read_events(first).await
+    });
+    let second = read_events(second).await;
     assert_eq!(first[2].1["summary"]["through_message_id"], boundary);
-    assert!(second[0].1["summary"].is_null());
-    assert_eq!(second[1].1["summary"]["through_message_id"], boundary);
-    assert!(
-        !second
-            .iter()
-            .any(|(name, data)| name == "compaction" && data["running"] == true)
-    );
+    assert_eq!(second[0].1["summary"]["through_message_id"], boundary);
+    assert!(!second.iter().any(|(name, _)| name == "compaction"));
     let requests = vision.take();
     assert_eq!(
         requests.iter().filter(|req| req["stream"] == false).count(),
@@ -632,9 +641,30 @@ async fn compaction_covers_old_middle_and_recent_messages_in_one_megabyte_chat()
 async fn revoked_text_source_blocks_summarization_and_disclosure() {
     let (mut state, base) = docs_state_with(0).await;
     let vision = Mockmodel::start(&mut state, false).await;
+    let state_mut = Arc::get_mut(&mut state).unwrap();
+    state_mut.traces = turn_trace::Store::in_memory(state_mut.db.clone());
     let app = router(state.clone());
     let admin = admin_cookie(&app).await;
-    let (user, cookie) = active_user(&app, &admin, "akses-ringkasan@example.com").await;
+    let email = "akses-ringkasan@example.com";
+    let (user, _) = active_user(&app, &admin, email).await;
+    let path = format!("/api/admin/users/{user}");
+    let grant = |departments| {
+        send(
+            &app,
+            "POST",
+            &path,
+            Some(json!({ "departments": departments })),
+            Some(&admin),
+        )
+    };
+    assert_eq!(
+        grant(vec!["Review", "Operasional"]).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let cookie = login(&app, email, "password-alex-123")
+        .await
+        .cookie
+        .unwrap();
     let (doc_id, metadata_id): (i64, i64) = state
         .db
         .call(|c| {
@@ -658,6 +688,9 @@ async fn revoked_text_source_blocks_summarization_and_disclosure() {
         source: "Review".into(),
         kind: "txt".into(),
         page: None,
+        scan: false,
+        handwriting: None,
+        scan_rev: None,
         sheet: None,
         image: None,
         evidence_only: false,
@@ -715,17 +748,24 @@ async fn revoked_text_source_blocks_summarization_and_disclosure() {
     assert_eq!(requests.len(), 1);
     assert_eq!(references(&requests[0]), expected);
 
-    state
-        .db
-        .call(move |c| {
-            c.execute(
-                "UPDATE documents_v4 SET visibility = '{\"type\":\"admin\"}' WHERE id = ?1",
-                [doc_id],
-            )?;
-            Ok(())
-        })
+    assert_eq!(
+        grant(vec!["Operasional"]).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(&app, "GET", "/api/me", None, Some(&cookie))
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    let cookie = login(&app, email, "password-alex-123")
         .await
+        .cookie
         .unwrap();
+    assert_eq!(
+        send(&app, "GET", "/api/me", None, Some(&cookie)).await.body["departments"],
+        json!(["Operasional"])
+    );
     let detail = send(
         &app,
         "GET",
@@ -749,6 +789,24 @@ async fn revoked_text_source_blocks_summarization_and_disclosure() {
         let requests = vision.take();
         assert_eq!(requests.len(), 1);
         assert!(!requests[0]["input"].to_string().contains(RECAP));
+        state.traces.flush().await;
+        let conv = id.clone();
+        let captured = state
+            .db
+            .call(move |c| {
+                let input: String = c.query_row(
+                    "SELECT e.data FROM trace_events e
+                 JOIN turn_traces t ON t.id=e.turn_id JOIN messages m ON m.id=t.question_id
+                 WHERE m.conversation_id=?1 AND e.kind='input' ORDER BY e.seq DESC LIMIT 1",
+                    [conv],
+                    |row| row.get(0),
+                )?;
+                Ok(serde_json::from_str::<Value>(&input)?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(captured, requests[0]["input"]);
+        assert!(!captured.to_string().contains("uji-potongan-torsi"));
     }
     drop((app, state));
     let _ = std::fs::remove_dir_all(base);

@@ -44,7 +44,7 @@ pub(super) fn open_reader(path: &Path) -> Result<Connection> {
 }
 
 pub(super) fn snapshot(conn: &mut Connection) -> Result<Vec<Indexed>> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
     let mut vectors = {
         let mut s = tx.prepare("SELECT hash, embedding FROM vectors")?;
         s.query_map([], |row| {
@@ -108,7 +108,8 @@ pub(super) struct Store {
 
 impl Store {
     pub(super) fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
+        conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;

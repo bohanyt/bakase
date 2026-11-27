@@ -524,6 +524,9 @@ var AppSnapshot = (function(exports) {
 			"treeitem"
 		]);
 	}
+	/**
+	* TODO https://github.com/eps1lon/dom-accessibility-api/issues/100
+	*/
 	function isDescendantOfNativeHostLanguageTextAlternativeElement(node) {
 		return false;
 	}
@@ -954,6 +957,291 @@ var AppSnapshot = (function(exports) {
 		var localName = getLocalName(element);
 		return elementsSupportingDisabledAttribute.has(localName) && element.hasAttribute("disabled") ? true : element.getAttribute("aria-disabled") === "true";
 	}
+	// ../extension/src/pointer.js
+	var RED = "#365a77";
+	/** Tiga denyut, lalu diam 3 detik, berulang sampai disentuh (pengecualian AGENTS.md poin 4). */
+	var PULSE_MS = 600;
+	var PAUSE_MS = 3e3;
+	var GAP = 8;
+	var EDGE = 8;
+	/** Jarak ujung panah dari sisi kiri balon. */
+	var ARROW = 24;
+	var SVG = "http://www.w3.org/2000/svg";
+	var NO_STROKE = { stroke: "none" };
+	var eye = (x) => [
+		["circle", {
+			cx: x,
+			cy: 116,
+			r: 21,
+			fill: "#fff"
+		}],
+		["ellipse", {
+			cx: x,
+			cy: 116,
+			rx: 10,
+			ry: 13,
+			fill: "#188f99",
+			...NO_STROKE
+		}],
+		["ellipse", {
+			cx: x + 1,
+			cy: 117,
+			rx: 5.5,
+			ry: 8,
+			fill: "#1b2433",
+			...NO_STROKE
+		}],
+		["circle", {
+			cx: x - 2,
+			cy: 111,
+			r: 3.2,
+			fill: "#fff",
+			...NO_STROKE
+		}]
+	];
+	/** Kepala Bakase dari web/public/brand/app-head.svg, tanpa tulisan kecil di helm. */
+	var HEAD = [
+		["path", {
+			d: "M15 78H115V142Q115 160 65 160Q15 160 15 142Z",
+			fill: "#dce4e9"
+		}],
+		...eye(42),
+		...eye(88),
+		["path", {
+			d: "M63 114Q65 108 67 114M21 113L14 110M109 113L116 110M57 146Q65 153 73 146",
+			fill: "none"
+		}],
+		["path", {
+			d: "M10 75C11 43 29 25 57 23H73C101 25 119 43 120 75Z",
+			fill: "#fff"
+		}],
+		["path", {
+			d: "M49 54L55 22Q56 17 61 17H69Q74 17 75 22L81 54",
+			fill: "#eef1f4"
+		}],
+		["path", {
+			d: "M12 65L43 65V73H10ZM87 65H118L120 73H87Z",
+			fill: "#365a77",
+			...NO_STROKE
+		}],
+		["path", {
+			d: "M9 77Q65 72 121 77L125 84Q125 89 119 89H11Q5 89 5 84Z",
+			fill: "#fff"
+		}]
+	];
+	function node(name, attributes) {
+		const el = document.createElementNS(SVG, name);
+		for (const [key, value] of Object.entries(attributes)) el.setAttribute(key, String(value));
+		return el;
+	}
+	function head() {
+		const svg = node("svg", {
+			viewBox: "0 0 148 148",
+			width: 25,
+			height: 25,
+			fill: "none"
+		});
+		const group = node("g", {
+			transform: "translate(9 -14)",
+			stroke: "#1b2433",
+			"stroke-width": 3.2,
+			"stroke-linecap": "round",
+			"stroke-linejoin": "round"
+		});
+		group.append(...HEAD.map(([name, attributes]) => node(name, attributes)));
+		svg.append(group);
+		return svg;
+	}
+	var CSS = `
+  :host { all: initial; position: fixed; inset: 0 auto auto 0; display: block; margin: 0; padding: 0; border: 0;
+    background: none; overflow: visible; pointer-events: none; z-index: 2147483647; }
+  .balon { position: fixed; display: flex; align-items: center; gap: 7px; padding: 5px 10px 5px 5px; border: 1px solid #d9d9d9;
+    border-radius: 12px; background: #fff; color: #0d0d0d; box-shadow: 0 8px 28px #0003; font: 450 14px/1.4 "Segoe UI", sans-serif;
+    white-space: nowrap; pointer-events: auto; cursor: pointer; }
+  .balon::before { content: ""; position: absolute; top: -6px; left: 19px; width: 9px; height: 9px; transform: rotate(45deg);
+    background: #fff; border: solid #d9d9d9; border-width: 1px 0 0 1px; }
+  .balon.atas::before { top: auto; bottom: -6px; border-width: 0 1px 1px 0; }
+  .cincin { position: fixed; box-sizing: border-box; border: 2px solid ${RED}; border-radius: 4px; pointer-events: none; }
+  .cahaya { position: absolute; inset: -2px; border-radius: 6px; box-shadow: 0 0 18px 7px ${RED}cc; opacity: 0.6; }
+`;
+	/** Kunci animasi satu putaran: tiga kali terang-redup, lalu diam sampai putaran berikutnya. */
+	function pulseFrames(pulses = 3, pulseMs = PULSE_MS, pauseMs = PAUSE_MS) {
+		const total = pulses * pulseMs + pauseMs;
+		const frames = [{
+			opacity: 0,
+			offset: 0
+		}];
+		for (let i = 0; i < pulses; i++) {
+			frames.push({
+				opacity: 1,
+				offset: (i * pulseMs + pulseMs / 2) / total
+			});
+			frames.push({
+				opacity: 0,
+				offset: (i + 1) * pulseMs / total
+			});
+		}
+		frames.push({
+			opacity: 0,
+			offset: 1
+		});
+		return {
+			frames,
+			total
+		};
+	}
+	var BUSY_CSS = `
+  :host { all: initial; position: fixed; inset: 0; display: block; margin: 0; padding: 0; border: 0;
+    background: none; overflow: visible; pointer-events: none; z-index: 2147483646; }
+  .tepi { position: fixed; inset: 0; pointer-events: none;
+    box-shadow: inset 0 0 0 2px ${RED}, inset 0 0 26px 6px ${RED}99, inset 0 0 80px 18px ${RED}33; }
+  .label { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); padding: 5px 12px; border-radius: 999px;
+    background: #fff; color: #0d0d0d; border: 1px solid ${RED}66; box-shadow: 0 6px 20px #0003;
+    font: 500 13px/1.4 "Segoe UI", sans-serif; white-space: nowrap; }
+`;
+	/**
+	* Tanda di tepi layar selama Bakase bekerja di halaman (misalnya mengambil tabel): gradasi merah
+	* yang bernapas pelan, diam kalau sistem meminta animasi dikurangi. Mengembalikan fungsi penutup.
+	*/
+	function busy(text) {
+		const host = document.createElement("app-sibuk");
+		host.setAttribute("aria-hidden", "true");
+		const root = host.attachShadow({ mode: "closed" });
+		const sheet = new CSSStyleSheet();
+		sheet.replaceSync(BUSY_CSS);
+		root.adoptedStyleSheets = [sheet];
+		const edge = document.createElement("div");
+		edge.className = "tepi";
+		const label = document.createElement("div");
+		label.className = "label";
+		label.textContent = text;
+		root.append(edge, label);
+		document.documentElement.append(host);
+		try {
+			host.popover = "manual";
+			host.showPopover();
+		} catch {}
+		const glow = matchMedia("(prefers-reduced-motion: reduce)").matches ? null : edge.animate([{ opacity: .55 }, { opacity: 1 }], {
+			duration: 1400,
+			iterations: Infinity,
+			direction: "alternate"
+		});
+		return () => {
+			glow?.cancel();
+			host.remove();
+		};
+	}
+	function clearPointer() {
+		globalThis.__appPointer?.();
+	}
+	/**
+	* Menunjuk `el` sampai balon atau elemennya disentuh (klik atau ketuk), halaman dibaca lagi, atau
+	* elemennya hilang. Saat kursor di atas balon atau elemen, denyutnya berhenti tetapi penunjuk tetap ada.
+	*/
+	function point(el) {
+		clearPointer();
+		const host = document.createElement("app-penunjuk");
+		host.setAttribute("aria-hidden", "true");
+		const root = host.attachShadow({ mode: "closed" });
+		const sheet = new CSSStyleSheet();
+		sheet.replaceSync(CSS);
+		root.adoptedStyleSheets = [sheet];
+		const balloon = document.createElement("div");
+		balloon.className = "balon";
+		balloon.title = "Klik untuk menyembunyikan penunjuk";
+		balloon.append(head(), "Yang ini");
+		const ring = document.createElement("div");
+		ring.className = "cincin";
+		const glow = document.createElement("div");
+		glow.className = "cahaya";
+		ring.append(glow);
+		root.append(ring, balloon);
+		document.documentElement.append(host);
+		try {
+			host.popover = "manual";
+			host.showPopover();
+		} catch {}
+		let frame = 0;
+		let visible = true;
+		function place() {
+			frame = 0;
+			const box = el.getBoundingClientRect();
+			if (!el.isConnected || !box.width && !box.height) return clear();
+			const { offsetWidth: width, offsetHeight: height } = balloon;
+			const above = box.bottom + GAP + height > innerHeight && box.top - GAP - height > 0;
+			const left = Math.min(Math.max(EDGE, box.left - ARROW / 2), Math.max(EDGE, innerWidth - width - EDGE));
+			balloon.classList.toggle("atas", above);
+			balloon.style.visibility = ring.style.visibility = visible ? "visible" : "hidden";
+			Object.assign(ring.style, {
+				left: `${box.left}px`,
+				top: `${box.top}px`,
+				width: `${box.width}px`,
+				height: `${box.height}px`
+			});
+			balloon.style.left = `${left}px`;
+			balloon.style.top = `${above ? box.top - GAP - height : Math.min(box.bottom + GAP, innerHeight - height - EDGE)}px`;
+		}
+		const move = () => {
+			frame ||= requestAnimationFrame(place);
+		};
+		const watcher = new IntersectionObserver((entries) => {
+			visible = entries.at(-1).isIntersecting;
+			move();
+		});
+		watcher.observe(el);
+		const row = el.closest("[role=row], tr");
+		const seen = el.textContent;
+		const seenRow = row?.getAttribute("aria-rowindex");
+		const reuse = new MutationObserver(() => {
+			if (el.textContent !== seen || row?.getAttribute("aria-rowindex") !== seenRow) clear();
+		});
+		const rowChange = { attributeFilter: ["aria-rowindex"] };
+		reuse.observe(el, {
+			characterData: true,
+			childList: true,
+			subtree: true,
+			...row === el && rowChange
+		});
+		if (row && row !== el) reuse.observe(row, rowChange);
+		const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+		const { frames, total } = pulseFrames();
+		const pulse = still ? null : glow.animate(frames, {
+			duration: total,
+			iterations: Infinity
+		});
+		const hold = () => pulse?.pause();
+		const resume = () => pulse?.play();
+		function clear() {
+			cancelAnimationFrame(frame);
+			watcher.disconnect();
+			reuse.disconnect();
+			pulse?.cancel();
+			host.remove();
+			el.removeEventListener("click", clear, true);
+			el.removeEventListener("pointerenter", hold);
+			el.removeEventListener("pointerleave", resume);
+			window.removeEventListener("scroll", move, true);
+			window.removeEventListener("resize", move);
+			if (globalThis.__appPointer === clear) globalThis.__appPointer = null;
+		}
+		balloon.addEventListener("click", (event) => {
+			event.stopPropagation();
+			clear();
+		});
+		balloon.addEventListener("pointerenter", hold);
+		balloon.addEventListener("pointerleave", resume);
+		el.addEventListener("click", clear, true);
+		el.addEventListener("pointerenter", hold);
+		el.addEventListener("pointerleave", resume);
+		if (el.matches(":hover")) hold();
+		window.addEventListener("scroll", move, {
+			capture: true,
+			passive: true
+		});
+		window.addEventListener("resize", move);
+		globalThis.__appPointer = clear;
+		place();
+	}
 	// ../extension/src/snapshot.js
 	var NOTE = "\n[Terpotong: halaman lebih panjang dari batas baca.]";
 	var MAX_ROWS = 200;
@@ -987,6 +1275,7 @@ var AppSnapshot = (function(exports) {
 	]);
 	var TABLE_SELECTOR = "table, [role=\"table\"], [role=\"grid\"], [role=\"treegrid\"]";
 	var ROW_SELECTOR = "[role=\"row\"], tr";
+	var CELL_SELECTOR = "[role=\"gridcell\"], [role=\"cell\"], [role=\"columnheader\"], [role=\"rowheader\"], td, th";
 	var MESSAGES = /* @__PURE__ */ new Set(["alert", "status"]);
 	var ALWAYS = /* @__PURE__ */ new Set([
 		"dialog",
@@ -1084,33 +1373,34 @@ var AppSnapshot = (function(exports) {
 	}
 	async function act({ id, pageId, action, ref, direction, url, remaining_ms }) {
 		const receivedAt = performance.now();
-		if (!Number.isFinite(remaining_ms) || remaining_ms <= 0 || remaining_ms > 8e3) return { status: "timeout" };
+		const table = action === "ambil_tabel";
+		if (!Number.isFinite(remaining_ms) || remaining_ms <= 0 || remaining_ms > (table ? 62e3 : 8e3)) return { status: "timeout" };
 		const localDeadline = receivedAt + remaining_ms;
-		const check = (type) => chrome.runtime.sendMessage({
+		const check = (type, details) => chrome.runtime.sendMessage({
 			type,
 			id,
-			pageId
+			pageId,
+			...details
 		}).catch(() => false);
 		if (!await check("app:izin-aksi") || !await check("app:cek-aksi") || performance.now() >= localDeadline || location.href !== url || document.visibilityState !== "visible") return { status: "unavailable" };
 		const entry = ref && globalThis.__appRefs?.get(ref);
 		const el = entry?.node.deref();
 		if (ref && (!el?.isConnected || !el.getClientRects().length || hiddenUp(el) || el.closest(ROW_SELECTOR)?.getAttribute("aria-rowindex") !== entry.rowIndex || getComputedStyle(el).visibility !== "visible")) return { status: "stale_ref" };
+		if (table) {
+			if (!el?.matches(TABLE_SELECTOR)) return { status: "stale_ref" };
+			const watching = globalThis.__appFrameWatch?.pageId === pageId;
+			if (!watching) watchFrame(pageId, url);
+			const done = busy("Bakase sedang mengambil tabel");
+			try {
+				return await collectTable(el, url, Math.min(localDeadline - 750, performance.now() + 6e4), (rows) => check("app:lanjut-tabel", { rows }));
+			} finally {
+				done();
+				if (!watching) unwatchFrame(pageId);
+			}
+		}
 		if (action === "sorot") {
 			reveal(el);
-			globalThis.__appOutline?.cancel();
-			const marker = {
-				outline: "3px solid #0078d4",
-				outlineOffset: "-3px"
-			};
-			const outline = el.animate([marker, marker], {
-				duration: 2500,
-				fill: "none"
-			});
-			globalThis.__appOutline = outline;
-			outline.onfinish = () => {
-				outline.cancel();
-				if (globalThis.__appOutline === outline) globalThis.__appOutline = null;
-			};
+			point(el);
 			return { status: "highlighted" };
 		}
 		const scroller = scrollerOf(el);
@@ -1259,24 +1549,9 @@ var AppSnapshot = (function(exports) {
 		if (a("aria-current") && a("aria-current") !== "false") s.push("saat ini");
 		return s;
 	}
-	function readPage(prefix = "", base = 0, afterScroll = false) {
+	function pageContent(scope = document) {
 		const labelHints = /* @__PURE__ */ new WeakMap();
-		const refs = /* @__PURE__ */ new Map();
-		globalThis.__appRefs = refs;
-		const refEnds = [];
-		let seq = 0;
-		let pendingRef;
-		const ref = (el) => {
-			seq += 1;
-			const id = `${prefix}e${base + seq}`;
-			pendingRef = id;
-			refs.set(id, {
-				node: new WeakRef(el),
-				rowIndex: el.closest(ROW_SELECTOR)?.getAttribute("aria-rowindex")
-			});
-			return `[${id}]`;
-		};
-		const roots = [document];
+		const roots = [scope];
 		const shadowUp = /* @__PURE__ */ new Set();
 		for (let i = 0; i < roots.length; i++) for (const el of roots[i].querySelectorAll("*")) {
 			if (!el.shadowRoot) continue;
@@ -1291,7 +1566,9 @@ var AppSnapshot = (function(exports) {
 		const secrets = /* @__PURE__ */ new Set();
 		const secretUp = /* @__PURE__ */ new Set();
 		const checked = /* @__PURE__ */ new Set();
-		for (const el of deepAll(FIELD_SELECTOR)) {
+		const fields = deepAll(FIELD_SELECTOR);
+		for (let el = scope; el.matches; el = parentOf(el) || document) if (el.matches(FIELD_SELECTOR)) fields.push(el);
+		for (const el of fields) {
 			checked.add(el);
 			if (CHECKABLE.has(roleOf(el)) || !isSecret(el, labelHints)) continue;
 			secrets.add(el);
@@ -1321,24 +1598,25 @@ var AppSnapshot = (function(exports) {
 		const touchesSecret = (node) => secrets.has(node) || secretUp.has(node) || insideSecret(node);
 		const secretField = (el) => checked.has(el) ? secrets.has(el) : isSecret(el, labelHints);
 		/** Teks yang tampil di dalam node, tanpa isian (rahasia atau bukan), tanpa yang tersembunyi. */
-		const safeText = (node, max = MAX_TEXT) => {
+		const safeText = (node, max = MAX_TEXT, inCell = false) => {
 			if (insideSecret(node)) return "";
 			let out = "";
 			const visit = (n) => {
 				if (out.length > max) return;
 				if (n.nodeType === Node.TEXT_NODE) {
 					const holder = n.parentElement || n.parentNode?.host;
-					if (!holder || getComputedStyle(holder).visibility !== "hidden") out += ` ${n.textContent}`;
+					if (!holder || getComputedStyle(holder).visibility === "visible") out += inCell ? n.textContent : ` ${n.textContent}`;
 					return;
 				}
 				if (n.nodeType === Node.ELEMENT_NODE) {
 					if (secrets.has(n) || CONTROL_TAGS.has(n.tagName) || SKIP_TAGS.has(n.tagName)) return;
 					if (n.getAttribute("aria-hidden") === "true" || n.inert || !rendered(n)) return;
+					if (inCell && n.tagName === "IMG" && getComputedStyle(n).visibility === "visible") out += n.alt;
 				}
 				for (const c of childrenOf(n)) visit(c);
 			};
 			visit(node);
-			return clean(out, max);
+			return inCell ? out : clean(out, max);
 		};
 		/** Teks tampil sebuah blok: innerText kalau aman, selain itu dihitung tanpa isian rahasia dan
 		* tanpa bagian aria-hidden. */
@@ -1371,15 +1649,15 @@ var AppSnapshot = (function(exports) {
 			return clean(computeAccessibleDescription(el));
 		};
 		/** Nilai isian sebagai teks, `null` kalau berupa centang, atau `undefined` kalau rahasia. */
-		const fieldValue = (el, role) => {
+		const fieldValue = (el, role, full = false) => {
 			if (CHECKABLE.has(role)) return null;
-			if (secretField(el)) return void 0;
-			if (el.tagName === "SELECT") return Array.from(el.selectedOptions, (o) => clean(o.text)).join(", ");
+			if (insideSecret(el) || secretField(el)) return void 0;
+			if (el.tagName === "SELECT") return Array.from(el.selectedOptions, (o) => full ? o.text : clean(o.text)).join(", ");
 			if (role === "listbox") {
 				const picked = [];
 				const visit = (n) => {
 					if (n.nodeType !== Node.ELEMENT_NODE && n.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return;
-					if (n.getAttribute?.("aria-selected") === "true") picked.push(safeText(n, MAX_NAME));
+					if (n.getAttribute?.("aria-selected") === "true") picked.push(full ? safeText(n, CELL_BYTES, true) : safeText(n, MAX_NAME));
 					else for (const c of childrenOf(n)) visit(c);
 				};
 				for (const c of childrenOf(el)) visit(c);
@@ -1387,8 +1665,667 @@ var AppSnapshot = (function(exports) {
 			}
 			if (typeof el.value === "string" && el.tagName !== "BUTTON") return el.value;
 			if (el.isContentEditable) return el.innerText;
-			return el.getAttribute("aria-valuetext") ?? el.getAttribute("aria-valuenow") ?? safeText(el);
+			return el.getAttribute("aria-valuetext") ?? el.getAttribute("aria-valuenow") ?? (full ? safeText(el, CELL_BYTES, true) : safeText(el));
 		};
+		const cellText = (cell, max = MAX_NAME, full = false) => {
+			if (insideSecret(cell)) return "(rahasia)";
+			const controls = "input, select, textarea, img[alt], [role=\"checkbox\"], [role=\"radio\"], [role=\"switch\"]";
+			let value = (touchesSecret(cell) || shadowUp.has(cell) || cell.querySelector(`[aria-hidden="true"], [inert], ${controls}`) ? safeText(cell, max, true) : cell.innerText)?.trim() || "";
+			if (!value) {
+				const input = Array.from(cell.querySelectorAll(`${FIELD_SELECTOR}, ${controls}`)).find((i) => i.tagName !== "IMG" && shown(i));
+				if (input) {
+					const role = roleOf(input);
+					const v = fieldValue(input, role, full);
+					value = v === void 0 ? "(rahasia)" : v === null ? states(input, role).join(" ") : v;
+				}
+			}
+			return full ? value : clean(value, max);
+		};
+		return {
+			deepAll,
+			shadowUp,
+			touchesSecret,
+			blockText,
+			nameOf,
+			descOf,
+			fieldValue,
+			cellText
+		};
+	}
+	function shown(el) {
+		return rendered(el) && !hiddenUp(el) && getComputedStyle(el).visibility === "visible";
+	}
+	function tableRows(el) {
+		const head = [];
+		const body = [];
+		for (const r of el.querySelectorAll(ROW_SELECTOR)) {
+			if (r.closest(TABLE_SELECTOR) !== el || !shown(r)) continue;
+			const cells = Array.from(r.querySelectorAll(CELL_SELECTOR)).filter((c) => c.closest(ROW_SELECTOR) === r && shown(c));
+			(r.closest("thead") !== null || cells.length > 0 && cells.every((c) => c.getAttribute("role") === "columnheader" || c.tagName === "TH" && !c.getAttribute("role") && c.getAttribute("scope") !== "row") ? head : body).push({
+				r,
+				cells
+			});
+		}
+		return {
+			head,
+			body
+		};
+	}
+	var TABLE_ROWS = 5e3;
+	var TABLE_COLUMNS = 100;
+	var TABLE_BYTES = 2e6;
+	var CELL_BYTES = 8e3;
+	var END_WAIT = 850;
+	/** Grid yang memuat data dari server saat digulir roda (app) butuh waktu lebih lama. */
+	var WHEEL_WAIT = 2500;
+	var utf8 = new TextEncoder();
+	function positiveIndex(el, attr) {
+		const value = Number(el.getAttribute(attr));
+		return Number.isSafeInteger(value) && value > 0 ? value : null;
+	}
+	function clipBytes(text, max) {
+		const bytes = utf8.encode(text.slice(0, max));
+		if (bytes.length <= max) return text.slice(0, max).toWellFormed();
+		let end = max;
+		while ((bytes[end] & 192) === 128) end -= 1;
+		return new TextDecoder().decode(bytes.subarray(0, end));
+	}
+	function columnSlots(row, cellText, carried, header, issues) {
+		const slots = /* @__PURE__ */ new Map();
+		for (const [i, { value, remaining }] of carried) {
+			slots.set(i, header ? value : "");
+			if (remaining === 1) carried.delete(i);
+			else carried.get(i).remaining -= 1;
+		}
+		let next = positiveIndex(row.r, "aria-colindex") || 1;
+		for (const cell of row.cells) {
+			while (slots.has(next)) next += 1;
+			const start = positiveIndex(cell, "aria-colindex") ?? next;
+			const colSpan = positiveIndex(cell, "aria-colspan") || cell.colSpan || 1;
+			const rowSpan = positiveIndex(cell, "aria-rowspan") || cell.rowSpan || 1;
+			if (start + colSpan - 1 > TABLE_COLUMNS) issues.add("column_limit");
+			if (start > TABLE_COLUMNS) continue;
+			const full = cellText(cell, CELL_BYTES, true);
+			const value = clipBytes(full, CELL_BYTES);
+			if (value !== full) issues.add("cell_limit");
+			for (let i = start; i < start + colSpan && i <= TABLE_COLUMNS; i += 1) {
+				if (slots.has(i)) {
+					issues.add("missing_columns");
+					continue;
+				}
+				slots.set(i, i === start || header ? value : "");
+				if (rowSpan > 1) carried.set(i, {
+					value,
+					remaining: rowSpan - 1
+				});
+			}
+			next = start + colSpan;
+		}
+		return slots;
+	}
+	function waitForGrid(grid, move, deadline, maxWait) {
+		const wait = Math.min(maxWait, deadline - performance.now());
+		if (wait <= 0) return Promise.resolve();
+		return new Promise((resolve) => {
+			let raf;
+			let version = 0;
+			let previous = -1;
+			let quietFrames = 0;
+			const observer = new MutationObserver(() => {
+				version += 1;
+			});
+			const stop = () => {
+				observer.disconnect();
+				cancelAnimationFrame(raf);
+				clearTimeout(timer);
+				document.removeEventListener("visibilitychange", stop);
+				resolve();
+			};
+			const frame = () => {
+				quietFrames = version === previous ? quietFrames + 1 : 0;
+				previous = version;
+				if (!grid.isConnected || version > 0 && quietFrames >= 2) stop();
+				else raf = requestAnimationFrame(frame);
+			};
+			const timer = setTimeout(stop, wait);
+			observer.observe(grid, {
+				subtree: true,
+				childList: true,
+				characterData: true,
+				attributes: true
+			});
+			document.addEventListener("visibilitychange", stop, { once: true });
+			move?.();
+			raf = requestAnimationFrame(frame);
+		});
+	}
+	/** Area gulir samping milik grid: elemen di antara baris dan grid (atau induknya) yang isinya
+	* lebih lebar dari tampilannya. */
+	function sideScroller(grid, row) {
+		for (let el = row; el; el = parentOf(el)) {
+			if (el.clientWidth > 0 && el.scrollWidth > el.clientWidth + 1 && /^(auto|scroll|overlay)$/.test(getComputedStyle(el).overflowX)) return el;
+			if (el !== grid && el.contains(grid) && scrollBox(el)) return null;
+		}
+		return null;
+	}
+	function typicalHeight(body) {
+		const heights = body.filter(({ cells }) => cells.length).map(({ r }) => r.getBoundingClientRect().height);
+		return heights.sort((x, y) => x - y)[heights.length >> 1] ?? 0;
+	}
+	/** Tabel HTML yang hanya merender sebagian barisnya: ada ruang kosong di atas baris pertama atau di
+	* bawah baris terakhir (baris atau padding pengganti). */
+	function hasSpacer(grid, body) {
+		const boxes = body.filter(({ cells }) => cells.length).map(({ r }) => r.getBoundingClientRect());
+		if (boxes.length < 3) return false;
+		const typical = typicalHeight(body);
+		const rows = boxes.filter((b) => b.height <= typical * 3);
+		const box = grid.getBoundingClientRect();
+		const headBottom = grid.tHead ? grid.tHead.getBoundingClientRect().bottom : box.top;
+		const footTop = grid.tFoot?.rows.length ? grid.tFoot.getBoundingClientRect().top : box.bottom;
+		const slack = typical * 2 + (grid.caption?.getBoundingClientRect().height ?? 0);
+		return rows[0].top - headBottom > slack || footTop - rows.at(-1).bottom > slack;
+	}
+	async function collectTable(grid, url, deadline, allowed) {
+		const issues = /* @__PURE__ */ new Set();
+		const rows = /* @__PURE__ */ new Map();
+		const headers = [];
+		const title = clipBytes(document.title.trim() || location.hostname, 400);
+		const initial = tableRows(grid);
+		const rowCount = () => positiveIndex(grid, "aria-rowcount");
+		const colCount = () => positiveIndex(grid, "aria-colcount");
+		let expected = rowCount();
+		const declaredColumns = colCount();
+		const virtual = grid.tagName !== "TABLE" || ["grid", "treegrid"].includes(grid.getAttribute("role")) || grid.hasAttribute("aria-rowcount") && expected !== initial.body.length + initial.head.length || initial.body.some(({ r }) => getComputedStyle(r).position === "absolute") || hasSpacer(grid, initial.body);
+		const scroller = virtual ? scrollerOf(grid) : null;
+		const top = scroller?.scrollTop;
+		const left = scroller?.scrollLeft;
+		const scrollTo = (y) => scroller.scrollTo({
+			top: y,
+			left: scroller.scrollLeft,
+			behavior: "instant"
+		});
+		const bottom = () => scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1;
+		const running = async () => location.href === url && document.visibilityState === "visible" && grid.isConnected && await allowed(rows.size);
+		const needed = Math.min(declaredColumns ?? 0, TABLE_COLUMNS);
+		const missesColumns = () => Array.from(rows.values()).some(({ slots }) => slots.size < needed);
+		let width = needed;
+		let bytes = 0;
+		let firstData = initial.head.length + 1;
+		let indexed = true;
+		let indexedColumns = true;
+		let pending = false;
+		let stopped = false;
+		let slowRenders = 0;
+		let wheelMode = false;
+		/** Pita layar tempat baris benar-benar tampil: grid, layar, dan wadah baris yang memotong isinya. */
+		const band = () => {
+			const box = grid.getBoundingClientRect();
+			let top = Math.max(0, box.top);
+			let end = Math.min(innerHeight, box.bottom);
+			const row = tableRows(grid).body.find(({ r }) => positiveIndex(r, "aria-rowindex"))?.r;
+			for (let el = row && parentOf(row); el && el !== grid; el = parentOf(el)) {
+				if (getComputedStyle(el).overflowY === "visible") continue;
+				const clip = el.getBoundingClientRect();
+				top = Math.max(top, clip.top);
+				end = Math.min(end, clip.bottom);
+			}
+			return {
+				top,
+				end
+			};
+		};
+		const inView = (el, view = band()) => {
+			const box = el.getBoundingClientRect();
+			const middle = (box.top + box.bottom) / 2;
+			return box.height > 0 && middle > view.top && middle < view.end;
+		};
+		const shownIndexes = () => {
+			const view = band();
+			return tableRows(grid).body.filter(({ r }) => inView(r, view)).map(({ r }) => positiveIndex(r, "aria-rowindex")).filter(Boolean);
+		};
+		if (declaredColumns > TABLE_COLUMNS) issues.add("column_limit");
+		function sample({ head, body }) {
+			const count = rowCount();
+			if (expected !== null && count > expected) expected = count;
+			else if (count !== expected) issues.add("changed");
+			if (colCount() !== declaredColumns) issues.add("changed");
+			for (const [i, { r }] of head.entries()) firstData = Math.max(firstData, (positiveIndex(r, "aria-rowindex") ?? i + 1) + 1);
+			const { cellText } = pageContent(grid);
+			const loose = Array.from(grid.querySelectorAll("[role=\"columnheader\"]")).filter((c) => c.closest(TABLE_SELECTOR) === grid && !c.closest(ROW_SELECTOR) && shown(c));
+			const currentHeaders = [];
+			const headSpans = /* @__PURE__ */ new Map();
+			for (const h of loose.length ? [...head, {
+				r: grid,
+				cells: loose
+			}] : head) {
+				if (sideLeft !== null && h.cells.some((c) => !positiveIndex(c, "aria-colindex"))) continue;
+				const slots = columnSlots(h, cellText, headSpans, true, issues);
+				width = Math.max(width, ...slots.keys());
+				for (const [i, value] of slots) {
+					const parts = currentHeaders[i - 1] ??= [];
+					if (value && !parts.includes(value)) parts.push(value);
+				}
+			}
+			for (let i = 0; i < currentHeaders.length; i += 1) {
+				const value = currentHeaders[i]?.join(" / ");
+				if (value === void 0) continue;
+				const clipped = clipBytes(value, CELL_BYTES);
+				if (clipped !== value) issues.add("cell_limit");
+				if (headers[i] !== void 0 && headers[i] !== clipped) issues.add("changed");
+				headers[i] ??= clipped;
+			}
+			pending = false;
+			const rowSpans = /* @__PURE__ */ new Map();
+			const positions = /* @__PURE__ */ new Map();
+			const portTop = !scroller || scroller === document.scrollingElement ? 0 : scroller.getBoundingClientRect().top;
+			const typical = virtual ? typicalHeight(body) : 0;
+			const view = wheelMode ? band() : null;
+			let previousIndex = null;
+			for (const [i, row] of body.entries()) {
+				if (performance.now() >= deadline) {
+					issues.add("time_limit");
+					stopped = true;
+					break;
+				}
+				if (!row.cells.length && !rowSpans.size) continue;
+				const index = positiveIndex(row.r, "aria-rowindex") || row.cells[0] && positiveIndex(row.cells[0], "aria-rowindex") || null;
+				if (!index) indexed = false;
+				if (row.cells.some((cell) => !positiveIndex(cell, "aria-colindex"))) indexedColumns = false;
+				if (index !== null && previousIndex !== null && index !== previousIndex + 1) rowSpans.clear();
+				previousIndex = index;
+				const slots = columnSlots(row, cellText, rowSpans, false, issues);
+				width = Math.max(width, ...slots.keys());
+				const data = JSON.stringify([...slots]);
+				const empty = virtual && Array.from(slots.values()).every((value) => value === "");
+				if (empty && row.r.getBoundingClientRect().height > typical * 2.5) continue;
+				const position = scroller ? Math.round((row.r.getBoundingClientRect().top - portTop + scroller.scrollTop) * 2) : i;
+				const ordinal = positions.get(position) ?? 0;
+				positions.set(position, ordinal + 1);
+				const sticky = scroller && index === null && /sticky|fixed/.test(getComputedStyle(row.r).position);
+				const key = virtual && index !== null ? `i${index}` : sticky ? `s${data}` : `p${position}:${ordinal}`;
+				const stored = rows.get(key);
+				const awaited = !wheelMode || inView(row.r, view);
+				if (stored) {
+					for (const [column, value] of empty && wheelMode ? [] : slots) {
+						const old = stored.slots.get(column);
+						if (old === value) continue;
+						if (old !== void 0 && !stored.empty) issues.add("changed");
+						stored.slots.set(column, value);
+						bytes += utf8.encode(value).length + 3;
+					}
+					if (!empty) stored.empty = false;
+					else if (stored.empty && stored.waited !== true && awaited) pending = true;
+					if (bytes > TABLE_BYTES) issues.add("size_limit");
+				} else {
+					const rowBytes = utf8.encode(data).length + 1;
+					if (rows.size === TABLE_ROWS) issues.add("row_limit");
+					else if (bytes + rowBytes > TABLE_BYTES) issues.add("size_limit");
+					else {
+						rows.set(key, {
+							index,
+							position,
+							slots,
+							empty
+						});
+						if (empty && awaited) pending = true;
+						bytes += rowBytes;
+					}
+				}
+				if (issues.has("row_limit") || issues.has("size_limit")) {
+					stopped = true;
+					break;
+				}
+			}
+		}
+		/** Grid kadang baru merender setelah beberapa frame (mesin sibuk). Ditunggu sampai baris yang
+		* dirender menutup tampilan, supaya tidak ada baris yang terlewat. */
+		async function settleView() {
+			const until = Math.min(deadline, performance.now() + 2e3);
+			const covered = () => {
+				const start = scroller === document.scrollingElement ? 0 : scroller.getBoundingClientRect().top;
+				const end = Math.min(start + scroller.clientHeight, start + scroller.scrollHeight - scroller.scrollTop);
+				const { head, body } = tableRows(grid);
+				const under = Math.max(start, ...head.map(({ r }) => r.getBoundingClientRect()).filter((box) => box.top <= start + 4 && box.bottom < end).map((box) => box.bottom));
+				const typical = typicalHeight(body);
+				const boxes = body.filter(({ r, cells }) => cells.length && !/sticky|fixed/.test(getComputedStyle(r).position)).map(({ r }) => r.getBoundingClientRect()).filter((box) => box.height <= typical * 2.5 && box.bottom > under && box.top < end);
+				return boxes.some((box) => box.top <= under + Math.max(4, box.height / 2)) && boxes.some((box) => box.bottom >= end - Math.max(4, box.height / 2));
+			};
+			while (slowRenders < 3 && !covered()) {
+				if (performance.now() >= until) {
+					slowRenders += 1;
+					return;
+				}
+				await waitForGrid(grid, null, deadline, Math.max(1, until - performance.now()));
+			}
+			if (slowRenders < 3) slowRenders = 0;
+		}
+		/** Satu lintasan dari atas ke bawah. `settle` menunggu baris yang baru dimuat di ujung bawah. */
+		async function sweep(settle) {
+			if (scroller.scrollTop !== 0) await waitForGrid(grid, () => scrollTo(0), deadline, 180);
+			let endedAt = null;
+			await settleView();
+			while (await running()) {
+				const before = rows.size;
+				sample(tableRows(grid));
+				for (const until = performance.now() + END_WAIT; pending && !stopped && performance.now() < until;) {
+					await waitForGrid(grid, null, deadline, Math.max(1, until - performance.now()));
+					if (!await running()) return;
+					sample(tableRows(grid));
+				}
+				if (pending) {
+					for (const row of rows.values()) if (row.empty) row.waited = true;
+				}
+				if (stopped) return;
+				if (performance.now() >= deadline) {
+					issues.add("time_limit");
+					stopped = true;
+					return;
+				}
+				if (!bottom()) {
+					endedAt = null;
+					const from = scroller.scrollTop;
+					const step = Math.max(1, Math.floor(scroller.clientHeight * .85));
+					await waitForGrid(grid, () => scrollTo(from + step), deadline, 180);
+					if (scroller.scrollTop <= from) {
+						issues.add("missing_rows");
+						return;
+					}
+					await settleView();
+					continue;
+				}
+				if (!settle) return;
+				const now = performance.now();
+				if (endedAt === null || rows.size !== before) endedAt = now;
+				const waited = now - endedAt;
+				if (waited >= END_WAIT && (waited >= END_WAIT * 4 || grid.getAttribute("aria-busy") !== "true")) return;
+				await waitForGrid(grid, null, deadline, Math.max(1, END_WAIT - waited));
+			}
+		}
+		/** Tabel biasa di dalam kotak gulir bisa menambah baris saat mentok di bawah. */
+		async function growStatic(box) {
+			const start = box.scrollTop;
+			try {
+				let count = tableRows(grid).body.length;
+				while (await running()) {
+					const until = Math.min(deadline, performance.now() + END_WAIT);
+					box.scrollTo({
+						top: box.scrollHeight,
+						left: box.scrollLeft,
+						behavior: "instant"
+					});
+					while (performance.now() < until && tableRows(grid).body.length === count) await waitForGrid(grid, null, deadline, Math.max(1, until - performance.now()));
+					const now = tableRows(grid).body.length;
+					if (now === count) return;
+					issues.add("unknown_rows");
+					count = now;
+					if (count > TABLE_ROWS) return;
+					if (performance.now() >= deadline) {
+						issues.add("time_limit");
+						return;
+					}
+				}
+			} finally {
+				if (box.isConnected) box.scrollTo({
+					top: start,
+					left: box.scrollLeft,
+					behavior: "instant"
+				});
+			}
+		}
+		const rowIndexes = () => tableRows(grid).body.map(({ r }) => positiveIndex(r, "aria-rowindex")).filter(Boolean);
+		const colIndexes = () => tableRows(grid).body.flatMap(({ cells }) => cells.map((c) => positiveIndex(c, "aria-colindex"))).filter(Boolean);
+		const firstShown = () => Math.min(...shownIndexes());
+		const wanted = () => expected - firstData + 1;
+		const lastShown = () => Math.max(0, ...shownIndexes());
+		const complete = () => rows.size >= wanted() && !Array.from(rows.values()).some((row) => row.empty) && !(needed && missesColumns());
+		/** Roda mouse tiruan di baris grid. Tidak menggerakkan kursor, klik, atau memindah fokus. */
+		function wheel(dx, dy) {
+			(tableRows(grid).body.find(({ r }) => r.getBoundingClientRect().height > 0)?.r ?? grid).dispatchEvent(new WheelEvent("wheel", {
+				deltaX: dx,
+				deltaY: dy,
+				deltaMode: 0,
+				bubbles: true,
+				cancelable: true
+			}));
+		}
+		const wheelStep = () => {
+			const view = band();
+			return Math.max(60, Math.floor((view.end - view.top) * .85));
+		};
+		const wheelSide = () => Math.max(120, Math.floor(grid.getBoundingClientRect().width * .85));
+		/** Kembali ke baris pertama semula, dengan langkah sebesar tinggi baris. */
+		async function wheelTo(target) {
+			for (let i = 0; i < 6 && Number.isFinite(target) && grid.isConnected && location.href === url; i += 1) {
+				const now = firstShown();
+				if (!Number.isFinite(now) || now === target) return;
+				const height = typicalHeight(tableRows(grid).body) || 24;
+				await waitForGrid(grid, () => wheel(0, (target - now) * height), deadline + 3e3, 600);
+				if (firstShown() === now) return;
+			}
+		}
+		/** Gulir roda sampai ukuran yang dipantau tidak berubah lagi, misalnya baris paling atas. */
+		async function wheelUntil(dx, dy, measure, done, extra = 0) {
+			for (let i = 0; i < 300 && !done() && grid.isConnected && location.href === url && performance.now() < deadline + extra; i += 1) {
+				const before = measure();
+				await waitForGrid(grid, () => wheel(dx, dy), deadline + extra, 600);
+				if (measure() === before) return;
+			}
+		}
+		/** Grid tanpa area gulir asli (misalnya app) hanya bergerak lewat roda. Baris dikumpulkan per
+		* nomor baris dari atas sampai jumlahnya sesuai aria-rowcount. */
+		async function wheelSweep() {
+			const step = wheelStep();
+			await wheelUntil(0, -step * 3, firstShown, () => firstShown() <= firstData);
+			let stuck = 0;
+			while (await running() && !stopped) {
+				sample(tableRows(grid));
+				for (const until = performance.now() + WHEEL_WAIT; pending && !stopped && performance.now() < until;) {
+					await waitForGrid(grid, null, deadline, Math.max(1, until - performance.now()));
+					if (!await running()) return;
+					sample(tableRows(grid));
+				}
+				if (pending) {
+					const seen = new Set(shownIndexes());
+					for (const row of rows.values()) if (row.empty && seen.has(row.index)) row.waited = true;
+				}
+				if (stopped || complete() || lastShown() >= expected) return;
+				if (performance.now() >= deadline) {
+					issues.add("time_limit");
+					stopped = true;
+					return;
+				}
+				const before = firstShown();
+				const moved = () => Number.isFinite(before) && firstShown() > before;
+				await waitForGrid(grid, () => wheel(0, step), deadline, WHEEL_WAIT);
+				if (!moved()) await waitForGrid(grid, null, deadline, WHEEL_WAIT);
+				if (!moved()) {
+					stuck += 1;
+					if (stuck >= 3) return;
+				} else stuck = 0;
+			}
+		}
+		let side = null;
+		let sideLeft = null;
+		let wheeled = null;
+		try {
+			if (!scroller) {
+				const box = grid.hasAttribute("aria-rowcount") ? null : scrollerOf(grid);
+				if (box && box !== document.scrollingElement && box.scrollHeight > box.clientHeight + 1) await growStatic(box);
+				sample(tableRows(grid));
+			} else {
+				await sweep(true);
+				if (indexed && expected !== null && rows.size < expected - firstData + 1 && !stopped) await sweep(true);
+				if (indexed && expected !== null && !complete() && !stopped && !grid.contains(scroller) && rowIndexes().length && await running()) {
+					wheeled = {
+						top: firstShown(),
+						left: 0,
+						count: rowCount()
+					};
+					wheelMode = true;
+					for (const row of rows.values()) row.waited = false;
+					await wheelSweep();
+					for (let k = 0; k < 30 && indexedColumns && missesColumns() && !stopped && await running(); k += 1) {
+						const before = Math.max(0, ...colIndexes());
+						await waitForGrid(grid, () => wheel(wheelSide(), 0), deadline, WHEEL_WAIT);
+						if (Math.max(0, ...colIndexes()) <= before) break;
+						wheeled.left += 1;
+						await wheelSweep();
+					}
+				}
+				for (const { r } of tableRows(grid).body) if (side = sideScroller(grid, r)) break;
+				if (side && declaredColumns === null) issues.add("missing_columns");
+				if (side && indexed && indexedColumns && missesColumns()) {
+					sideLeft = side.scrollLeft;
+					const step = Math.max(1, Math.floor(side.clientWidth * .85));
+					const last = side.scrollWidth - side.clientWidth;
+					for (let x = 0; !stopped && missesColumns(); x = Math.min(x + step, last)) {
+						await waitForGrid(grid, () => side.scrollTo({
+							left: x,
+							behavior: "instant"
+						}), deadline, 180);
+						await sweep(false);
+						if (x >= last || !await running()) break;
+					}
+				}
+			}
+			if (!await running()) return { status: "unavailable" };
+		} finally {
+			if (wheeled && grid.isConnected && location.href === url && rowCount() >= wheeled.count) {
+				if (wheeled.left) await wheelUntil(-wheelSide(), 0, () => Math.min(...colIndexes()), () => false, 3e3);
+				await wheelTo(wheeled.top);
+			}
+			if (side?.isConnected && sideLeft !== null) side.scrollTo({
+				left: sideLeft,
+				behavior: "instant"
+			});
+			if (scroller?.isConnected && (scroller.scrollTop !== top || scroller.scrollLeft !== left)) scroller.scrollTo({
+				top,
+				left,
+				behavior: "instant"
+			});
+		}
+		const ordered = Array.from(rows.values());
+		if (virtual && indexed) ordered.sort((a, b) => a.index - b.index);
+		else if (virtual) ordered.sort((a, b) => a.position - b.position);
+		if (virtual && (!indexed || expected === null)) issues.add("unknown_rows");
+		if (expected !== null && (ordered.length !== expected - firstData + 1 || indexed && ordered.some((row, i) => row.index !== firstData + i)) || ordered.some((row) => row.empty) || grid.getAttribute("aria-busy") === "true") issues.add("missing_rows");
+		const blank = /* @__PURE__ */ new Set();
+		for (let i = 1; i <= width; i += 1) if (!headers[i - 1]?.trim() && ordered.length && ordered.every(({ slots }) => !slots.get(i))) blank.add(i);
+		if (declaredColumns !== null && (missesColumns() || width - blank.size > declaredColumns)) issues.add("missing_columns");
+		if (virtual && declaredColumns === null && ordered.some(({ slots }) => slots.size !== width)) issues.add("missing_columns");
+		if (!width) {
+			width = 1;
+			if (virtual) issues.add("missing_columns");
+		}
+		const kept = Array.from({ length: width }, (_, i) => i + 1).filter((i) => !blank.has(i));
+		if (!kept.length) kept.push(1);
+		const table = {
+			title,
+			columns: kept.map((i) => headers[i - 1] ?? `Kolom ${i}`),
+			rows: [],
+			issues: []
+		};
+		bytes = utf8.encode(JSON.stringify(table)).length + 256;
+		for (const { slots } of ordered) {
+			const row = kept.map((i) => slots.get(i) ?? "");
+			bytes += utf8.encode(JSON.stringify(row)).length + 1;
+			if (bytes > TABLE_BYTES) {
+				issues.add("size_limit");
+				break;
+			}
+			table.rows.push(row);
+		}
+		table.issues = Array.from(issues);
+		return {
+			status: "table",
+			table
+		};
+	}
+	/** Kotak nama Excel Online (alamat sel terpilih) di frame ini, kalau ada. */
+	var NAME_BOX = "input#NameBox, input[id*=\"NameBox\" i], input[aria-label=\"Name Box\" i], input[aria-label*=\"Kotak Nama\" i], input[title=\"Name Box\" i]";
+	/** Bagian halaman yang sedang difokuskan user di frame ini: sheet dan sel aktif (Excel Online),
+	* tab atau posisi yang aktif, isian yang sedang diisi, dan teks yang dipilih. Dicatat bersama
+	* hasil Baca halaman supaya Bakase tahu bagian mana yang dimaksud user. Nilai isian rahasia
+	* tidak pernah diambil. */
+	function readFocus() {
+		const items = [];
+		const labelHints = /* @__PURE__ */ new WeakMap();
+		const name = (el, max = 80) => clean(el.getAttribute("aria-label") || el.innerText || el.textContent || "", max);
+		const found = document.querySelector(NAME_BOX);
+		const nameBox = found && !isSecret(found, labelHints) ? found : null;
+		const tabs = Array.from(document.querySelectorAll("[role=\"tab\"][aria-selected=\"true\"]")).filter(rendered);
+		if (nameBox) {
+			const sheetList = /sheet|lembar/i;
+			const listName = (tab) => {
+				const list = tab.closest("[role=\"tablist\"]");
+				if (!list) return "";
+				const ids = (list.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
+				return list.getAttribute("aria-label") || ids.map((id) => document.getElementById(id)?.textContent || "").join(" ");
+			};
+			const lowest = () => tabs.reduce((low, tab) => !low || tab.getBoundingClientRect().top > low.getBoundingClientRect().top ? tab : low, null);
+			const sheetTab = tabs.find((tab) => sheetList.test(listName(tab))) || lowest();
+			const sheet = sheetTab ? name(sheetTab) : "";
+			if (sheet) items.push(`sheet aktif ${quote(sheet)}`);
+			const cell = (nameBox.value || "").trim();
+			if (/^[\p{L}\p{N}_.$:!' ]{1,60}$/u.test(cell)) items.push(`sel dipilih ${cell}`);
+		} else for (const tab of tabs.slice(0, 3)) {
+			const text = name(tab);
+			if (text) items.push(`tab aktif ${quote(text)}`);
+		}
+		const current = Array.from(document.querySelectorAll("[aria-current]:not([aria-current=\"false\"])")).filter(rendered);
+		for (const el of current.slice(0, 2)) {
+			const text = name(el);
+			if (text) items.push(`posisi aktif ${quote(text)}`);
+		}
+		const active = document.activeElement;
+		const secret = active ? isSecret(active, labelHints) : false;
+		if (active && active !== document.body && active !== document.documentElement && active !== nameBox && rendered(active)) {
+			const role = roleOf(active);
+			const label = clean(active.labels?.[0]?.innerText || active.getAttribute("aria-label") || active.getAttribute("placeholder") || active.getAttribute("title") || "", 80);
+			const field = FIELDS.has(role) || CONTROL_TAGS.has(active.tagName) || active.isContentEditable;
+			if (field && !secret && !NOT_FIELD_INPUTS.has((active.type || "").toLowerCase())) {
+				const value = clean(active.isContentEditable ? active.innerText : active.value || "", 100);
+				items.push(`isian aktif${label ? ` ${quote(label)}` : ""}${value ? ` berisi ${quote(value)}` : ""}`);
+			} else if (!field && role && label) items.push(`elemen aktif ${role} ${quote(label)}`);
+		}
+		const selection = globalThis.getSelection?.();
+		const raw = String(selection ?? "");
+		const touchesSecret = raw.trim() !== "" && pageContent().deepAll(FIELD_SELECTOR).some((el) => {
+			if (!isSecret(el, labelHints)) return false;
+			if (selection.rangeCount > 0 && selection.containsNode(el, true)) return true;
+			const value = el.isContentEditable ? el.innerText : el.value;
+			return typeof value === "string" && value.trim() !== "" && raw.includes(value.trim());
+		});
+		const selected = secret || touchesSecret ? "" : clean(raw, 300);
+		if (selected) items.push(`teks dipilih ${quote(selected)}`);
+		return items.map((item) => item.replace(/[\uD800-\uDFFF]/gu, ""));
+	}
+	/** Fokus hanya tambahan: kalau gagal dibaca, snapshot tetap jalan tanpa fokus. */
+	function safeFocus() {
+		try {
+			return readFocus();
+		} catch {
+			return [];
+		}
+	}
+	function readPage(prefix = "", base = 0, afterScroll = false) {
+		clearPointer();
+		const refs = /* @__PURE__ */ new Map();
+		globalThis.__appRefs = refs;
+		const refEnds = [];
+		let seq = 0;
+		let pendingRef;
+		const ref = (el) => {
+			seq += 1;
+			const id = `${prefix}e${base + seq}`;
+			pendingRef = id;
+			refs.set(id, {
+				node: new WeakRef(el),
+				rowIndex: el.closest(ROW_SELECTOR)?.getAttribute("aria-rowindex")
+			});
+			return `[${id}]`;
+		};
+		const { deepAll, shadowUp, touchesSecret, blockText, nameOf, descOf, fieldValue, cellText } = pageContent();
 		const lines = [];
 		let used = 0;
 		let cut = false;
@@ -1428,32 +2365,10 @@ var AppSnapshot = (function(exports) {
 			if (emit(0, `${getRole(el) || "pesan"}: ${quote(text)}`)) stats.messages += 1;
 			shownMessages.add(el);
 		}
-		const cellText = (cell) => {
-			const text = blockText(cell, MAX_NAME);
-			if (text) return text;
-			const input = Array.from(cell.querySelectorAll(FIELD_SELECTOR)).find((i) => rendered(i) && !i.closest("[aria-hidden=\"true\"]"));
-			if (!input) return "";
-			const role = roleOf(input);
-			const v = fieldValue(input, role);
-			if (v === void 0) return "(rahasia)";
-			return v === null ? states(input, role).join(" ") : clean(v);
-		};
 		function table(el, role, depth) {
 			stats.tables += 1;
 			const name = nameOf(el, role);
-			const owner = (r) => r.closest("[role=\"grid\"], [role=\"treegrid\"], [role=\"table\"], table");
-			const cellsOf = (r) => Array.from(r.querySelectorAll("[role=\"gridcell\"], [role=\"cell\"], [role=\"columnheader\"], [role=\"rowheader\"], td, th")).filter((c) => c.closest("[role=\"row\"], tr") === r && rendered(c) && !c.closest("[aria-hidden=\"true\"]"));
-			const columnHeader = (c) => c.getAttribute("role") === "columnheader" || c.tagName === "TH" && !c.getAttribute("role") && c.getAttribute("scope") !== "row";
-			const head = [];
-			const body = [];
-			for (const r of el.querySelectorAll("[role=\"row\"], tr")) {
-				if (owner(r) !== el || !rendered(r) || r.closest("[aria-hidden=\"true\"]")) continue;
-				const cells = cellsOf(r);
-				(r.closest("thead") !== null || cells.length > 0 && cells.every(columnHeader) ? head : body).push({
-					r,
-					cells
-				});
-			}
+			const { head, body } = tableRows(el);
 			const rowIndex = (r) => Number(r.getAttribute("aria-rowindex")) || 0;
 			let headMax = head.length;
 			for (const h of head) headMax = Math.max(headMax, rowIndex(h.r));
@@ -1476,7 +2391,7 @@ var AppSnapshot = (function(exports) {
 				const n = rowIndex(r) - headMax;
 				const st = states(r, "row");
 				const label = `baris${n > 0 ? ` ${n}` : ""} ${ref(r)}${st.length ? ` ${st.join(" ")}` : ""}`;
-				if (!emit(depth + 1, `${label}: ${cells.map(cellText).join(" | ")}`)) return;
+				if (!emit(depth + 1, `${label}: ${cells.map((cell) => cellText(cell)).join(" | ")}`)) return;
 				stats.rows += 1;
 			}
 			if (body.length > MAX_ROWS) emit(depth + 1, `… ${body.length - MAX_ROWS} baris lagi tidak ditampilkan`);
@@ -1583,6 +2498,7 @@ var AppSnapshot = (function(exports) {
 			url: location.href,
 			text,
 			refEnds,
+			focus: safeFocus(),
 			stats: {
 				...stats,
 				refs: seq,
@@ -1592,6 +2508,7 @@ var AppSnapshot = (function(exports) {
 		};
 	}
 	exports.act = act;
+	exports.readFocus = readFocus;
 	exports.readPage = readPage;
 	exports.unwatchFrame = unwatchFrame;
 	exports.watchFrame = watchFrame;

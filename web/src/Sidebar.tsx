@@ -1,9 +1,18 @@
-import { DotsThreeIcon, FoldersIcon, KeyIcon, MagnifyingGlassIcon, NotePencilIcon, PencilSimpleIcon, SidebarSimpleIcon, SignOutIcon, TrashIcon, UsersIcon } from "@phosphor-icons/react";
+import { DotsThreeIcon, FilesIcon, FoldersIcon, KeyIcon, MagnifyingGlassIcon, NotePencilIcon, PencilSimpleIcon, SidebarSimpleIcon, SignOutIcon, SquaresFourIcon, TrashIcon, UsersIcon } from "@phosphor-icons/react";
 import { useEffect, useRef, useState } from "react";
-import type { User } from "./api";
+import { departmentList, type User } from "./api";
 import { groupLabel } from "./time";
 
 export type Conversation = { id: string; title: string; updated_at: number };
+
+/** Halaman yang dibuka dari baris atas sidebar. */
+export type SidePage = "documents" | "files" | "apps";
+
+const PAGES: Array<{ id: SidePage; label: string; Icon: typeof FoldersIcon }> = [
+  { id: "documents", label: "Sumber Data", Icon: FoldersIcon },
+  { id: "files", label: "File Saya", Icon: FilesIcon },
+  { id: "apps", label: "Aplikasi", Icon: SquaresFourIcon },
+];
 
 const GROUP_ORDER = ["Hari ini", "Kemarin", "7 hari terakhir", "30 hari terakhir", "Lebih lama"];
 
@@ -84,7 +93,7 @@ function ConversationItem({
             className="danger"
             onClick={() => {
               setMenu(false);
-              if (window.confirm(`Hapus percakapan "${c.title}"?`)) onDelete();
+              if (window.confirm(`Hapus percakapan "${c.title}" dari daftar? Salinannya tetap disimpan di arsip IT.`)) onDelete();
             }}
           >
             <TrashIcon size={15} /> Hapus
@@ -107,8 +116,9 @@ export function Sidebar({
   onSelect,
   onRename,
   onDelete,
-  documentsActive,
-  onDocuments,
+  page,
+  onPage,
+  showApps,
   onAdmin,
   onPassword,
   onLogout,
@@ -124,8 +134,10 @@ export function Sidebar({
   onSelect: (id: string) => void;
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
-  documentsActive: boolean;
-  onDocuments: () => void;
+  page: SidePage | null;
+  onPage: (page: SidePage) => void;
+  /** Ada aplikasi yang boleh dipakai user ini. */
+  showApps: boolean;
   onAdmin: () => void;
   onPassword: () => void;
   onLogout: () => void;
@@ -175,15 +187,18 @@ export function Sidebar({
             </>
           )}
         </button>
-        <button
-          type="button"
-          className={`side-row${documentsActive ? " active" : ""}`}
-          onClick={onDocuments}
-          title="Sumber Data"
-          aria-current={documentsActive ? "page" : undefined}
-        >
-          <FoldersIcon size={18} /> {!collapsed && <span>Sumber Data</span>}
-        </button>
+        {PAGES.filter((p) => p.id !== "apps" || showApps).map(({ id, label, Icon }) => (
+          <button
+            key={id}
+            type="button"
+            className={`side-row${page === id ? " active" : ""}`}
+            onClick={() => onPage(id)}
+            title={label}
+            aria-current={page === id ? "page" : undefined}
+          >
+            <Icon size={18} /> {!collapsed && <span>{label}</span>}
+          </button>
+        ))}
       </nav>
 
       {!collapsed && (
@@ -213,7 +228,7 @@ export function Sidebar({
           {!collapsed && (
             <span className="user-text">
               <span className="user-name">{user.name}</span>
-              <span className="user-dept">{user.department ?? (user.role === "admin" ? "Admin" : "")}</span>
+              <span className="user-dept">{departmentList(user.departments, user.department).join(", ") || (user.role === "admin" ? "Admin" : "")}</span>
             </span>
           )}
         </button>

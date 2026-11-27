@@ -3,7 +3,8 @@
     {"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","remaining_ms":12000,"action":"sorot","ref":"f14e1000001"},
     {"id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","remaining_ms":10000,"action":"gulir","ref":null,"direction":"down"},
     {"id":"cccccccccccccccccccccccccccccccc","remaining_ms":7500,"action":"gulir","ref":"e2","direction":"up"},
-    {"id":"dddddddddddddddddddddddddddddddd","remaining_ms":0,"action":"gulir","ref":"f14e3","direction":"to"}
+    {"id":"dddddddddddddddddddddddddddddddd","remaining_ms":0,"action":"gulir","ref":"f14e3","direction":"to"},
+    {"id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","remaining_ms":65000,"action":"ambil_tabel","ref":"f14e3"}
   ],
   "replies": [
     {"status":"highlighted"},
@@ -11,6 +12,7 @@
     {"status":"stale_ref"},
     {"status":"unavailable"},
     {"status":"failed"},
-    {"status":"timeout"}
+    {"status":"timeout"},
+    {"status":"table","table":{"title":"Contoh","columns":["Kode","Nilai"],"rows":[["=1+1","1.234,00"],["A",""]],"issues":["missing_rows"]}}
   ]
 }

@@ -167,6 +167,53 @@ fn documents_are_read_through_the_worker() {
     assert_eq!(summary["sheets"], 1, "{summary}");
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn excel_calculation_runs_in_the_limited_worker() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rag-hub-server"))
+        .args(["extract-attachment", "xlsx", "hitung"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let _job = worker_job::WorkerJob::attach(&child, 1024 * 1024 * 1024).unwrap();
+    let config = serde_json::to_vec(&serde_json::json!({
+        "file":"Uji.xlsx", "sql":"SELECT SUM(A), COUNT(A) FROM data", "budget":8000, "pending":false
+    }))
+    .unwrap();
+    let bytes = xlsx(
+        concat!(
+            r#"<row r="1"><c r="A1"><v>12</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><v>9</v></c></row>"#,
+            r#"<row r="3"><c r="A3"><f>1+2</f></c></row>"#,
+        ),
+        None,
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_u32_le(config.len() as u32).await.unwrap();
+    stdin.write_all(&config).await.unwrap();
+    stdin.write_all(&bytes).await.unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().await.unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let response: Result<String, String> = serde_json::from_slice(&out.stdout).unwrap();
+    let result: serde_json::Value = serde_json::from_str(&response.unwrap()).unwrap();
+    assert_eq!(result["baris_data"], 2);
+    assert_eq!(result["hasil"], serde_json::json!([[9, 1]]));
+    assert_eq!(
+        result["profil_kolom"]["kolom"],
+        serde_json::json!([["A", 1, 0, 0, 0, 0, 0, 1, 0]])
+    );
+}
+
 #[test]
 fn the_worker_refuses_to_run_without_the_server_limit() {
     let out = run("extract-attachment", "docx", &docx("Teks"));

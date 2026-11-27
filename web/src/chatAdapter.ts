@@ -1,5 +1,5 @@
 import type { ChatModelAdapter, ThreadMessage } from "@assistant-ui/react";
-import { UNAUTHORIZED_EVENT } from "./api.ts";
+import { ERROR_MODE, SESSION_CHECK_EVENT, UNAUTHORIZED_EVENT, realStatus, tabUserHeader } from "./api.ts";
 import { getJoke } from "./joke.ts";
 import type { AnswerMeta, ConversationSummary, FileRef, SourceRef, Step } from "./messages.ts";
 import { readPageAction } from "./pageAction.ts";
@@ -16,6 +16,45 @@ export type ChatHooks = {
   onDone: () => void;
 };
 
+/** Jeda sebelum satu kali kirim ulang otomatis. */
+const RETRY_MS = 1_000;
+
+/** Bukan `crypto.randomUUID`, yang hanya ada di halaman HTTPS. */
+function newTurnId() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Sekali lagi kalau jaringan putus sebelum server menjawab. ID kirimannya sama, jadi tidak tersimpan dua kali. */
+async function send(init: RequestInit & { signal: AbortSignal }) {
+  try {
+    return await fetch("/api/chat", init);
+  } catch (err) {
+    if (init.signal.aborted) throw err;
+    await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
+    if (init.signal.aborted) throw err;
+    return fetch("/api/chat", init);
+  }
+}
+
+const UNREACHABLE = "Bakase tidak bisa dihubungi. Cek jaringan, lalu kirim ulang.";
+const CUT_OFF = "Jawaban terputus di tengah jalan. Kirim ulang pertanyaannya. Kalau terus terjadi, hubungi IT.";
+
+/** Server mengirim tanda hidup setiap 15 detik, jadi diam selama ini berarti sambungannya mati. */
+const SILENCE_MS = 60_000;
+
+/** Potongan berikutnya, atau gagal kalau tidak ada satu byte pun selama `SILENCE_MS`. */
+async function readChunk(reader: ReadableStreamDefaultReader<string>) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const silence = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(CUT_OFF)), SILENCE_MS);
+  });
+  try {
+    return await Promise.race([reader.read(), silence]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Teks dan id lampiran pesan user terakhir. Lampiran ditaruh kotak tanya di metadata pesan. */
 function lastUserMessage(messages: readonly ThreadMessage[]) {
   const last = messages.findLast((m) => m.role === "user");
@@ -26,6 +65,7 @@ function lastUserMessage(messages: readonly ThreadMessage[]) {
 
 /** Server memegang riwayat; browser hanya mengirim pesan terbaru. */
 export function createChatAdapter(hooks: ChatHooks) {
+  let previousTurnId: string | undefined;
   return {
     async *run({ messages, abortSignal }) {
       const startedAt = Date.now();
@@ -39,31 +79,39 @@ export function createChatAdapter(hooks: ChatHooks) {
         const current = livePage(pageAttachments);
         if (!valid || current?.id !== page.id || current.refresh !== page.refresh) page = null;
       }
-      const res = await fetch("/api/chat", {
+      const turnId = newTurnId();
+      const previous = previousTurnId;
+      previousTurnId = turnId;
+      const res = await send({
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...ERROR_MODE, "Content-Type": "application/json", ...tabUserHeader() },
         body: JSON.stringify({
           conversation_id: hooks.getConversationId(),
           message,
           style: getJoke() ? "joke" : "normal",
           attachments,
+          turn_id: turnId,
+          previous_turn_id: previous,
           page: page && {
             origin: page.origin,
             attachment_id: page.attachmentId,
             text: page.refresh?.text,
+            ambil_tabel: page.ambilTabel,
           },
         }),
         signal: abortSignal,
       }).catch((err: unknown) => {
         if (abortSignal.aborted && page) releasePage(page);
-        throw err;
+        throw abortSignal.aborted ? err : new Error(UNREACHABLE);
       });
-      if (res.status === 401) {
+      const status = realStatus(res.status, res.headers.get("X-app-Status"));
+      if (status === 401) {
         window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
         throw new Error("Sesi berakhir. Silakan masuk lagi.");
       }
-      if (!res.ok || !res.body) {
-        let message = `Server menjawab ${res.status}.`;
+      if (status === 409) window.dispatchEvent(new Event(SESSION_CHECK_EVENT));
+      if (status < 200 || status >= 300 || !res.body) {
+        let message = `Server menjawab ${status}.`;
         try {
           const data = await res.json();
           if (typeof data?.message === "string") message = data.message;
@@ -101,7 +149,9 @@ export function createChatAdapter(hooks: ChatHooks) {
 
       try {
         while (true) {
-          const { value, done } = await reader.read();
+          const { value, done } = await readChunk(reader).catch((err: unknown) => {
+            throw abortSignal.aborted ? err : new Error(CUT_OFF);
+          });
           if (done) break;
           buffer += value;
 
@@ -123,7 +173,8 @@ export function createChatAdapter(hooks: ChatHooks) {
               if (questionId && typeof payload.question_id === "number") {
                 hooks.onQuestion(questionId, payload.question_id);
               }
-              hooks.onSummary(payload.summary ?? null);
+              // Balasan untuk kiriman ulang tidak membawa ringkasan; yang tampil dibiarkan.
+              if ("summary" in payload) hooks.onSummary(payload.summary);
               yield snapshot();
             } else if (event === "compaction") {
               compacting = payload.running === true;
@@ -179,7 +230,7 @@ export function createChatAdapter(hooks: ChatHooks) {
         if (abortSignal.aborted) return;
         if (streamError) throw streamError;
         if (!receivedDone) {
-          throw new Error("Jawaban terputus di tengah jalan. Kirim ulang pertanyaannya. Kalau terus terjadi, hubungi IT.");
+          throw new Error(CUT_OFF);
         }
       } catch (error) {
         if (!abortSignal.aborted) throw error;

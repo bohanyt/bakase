@@ -2,14 +2,15 @@
 //! menonaktifkan, dan mereset password.
 
 use crate::{
-    AppState,
+    AppState, access,
     acl::Role,
-    auth::{AdminUser, canonical_department, hash_password},
+    auth::{AdminUser, canonical_department, hash_blocking},
     db::now,
     error::ApiError,
 };
 use axum::{
     Json,
+    extract::rejection::JsonRejection,
     extract::{Path, State},
     http::StatusCode,
 };
@@ -24,6 +25,7 @@ pub struct UserRow {
     name: String,
     requested_department: Option<String>,
     department: Option<String>,
+    departments: Vec<String>,
     role: String,
     status: String,
     created_at: i64,
@@ -37,12 +39,12 @@ pub async fn list_users(
         .db
         .call(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, email, name, requested_department, department, role, status, created_at
-                 FROM users
+                "SELECT id, email, name, requested_department, department, role, status, created_at, departments
+                 FROM users_with_access WHERE id <> ?1
                  ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, created_at DESC",
             )?;
             let rows = stmt
-                .query_map([], |r| {
+                .query_map([crate::archive::SYSTEM_ID], |r| {
                     Ok(UserRow {
                         id: r.get(0)?,
                         email: r.get(1)?,
@@ -52,6 +54,7 @@ pub async fn list_users(
                         role: r.get(5)?,
                         status: r.get(6)?,
                         created_at: r.get(7)?,
+                        departments: access::from_row(r, 8)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -67,17 +70,23 @@ pub struct UpdateUser {
     status: Option<String>,
     #[serde(default)]
     role: Option<String>,
-    /// `Some("")` menghapus departemen.
+    /// Field tunggal untuk halaman admin versi lama.
     #[serde(default)]
     department: Option<String>,
+    #[serde(default)]
+    departments: Option<Vec<String>>,
 }
 
 pub async fn update_user(
     State(state): State<Arc<AppState>>,
     AdminUser(admin): AdminUser,
     Path(id): Path<i64>,
-    Json(req): Json<UpdateUser>,
+    body: Result<Json<UpdateUser>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
+    reject_system_account(id)?;
+    let Json(req) = body.map_err(|_| {
+        ApiError::bad_request("Data user tidak valid. Muat ulang halaman dan coba lagi.")
+    })?;
     let status = match req.status.as_deref() {
         None => None,
         Some(s @ ("pending" | "active" | "disabled")) => Some(s.to_string()),
@@ -92,10 +101,18 @@ pub async fn update_user(
                 .to_string(),
         ),
     };
-    let department = match req.department.as_deref().map(str::trim) {
-        None => None,
-        Some("") => Some(None),
-        Some(d) => Some(Some(canonical_department(d, &state.auth.departments)?)),
+    let departments = match (req.departments, req.department.as_deref().map(str::trim)) {
+        (Some(_), Some(_)) => return Err(ApiError::bad_request("Kirim satu pilihan akses.")),
+        (Some(mut departments), None) => {
+            for department in &mut departments {
+                *department = canonical_department(department, &state.auth.departments)?;
+            }
+            access::sort_departments(&mut departments);
+            Some(departments)
+        }
+        (None, Some("")) => Some(vec![]),
+        (None, Some(d)) => Some(vec![canonical_department(d, &state.auth.departments)?]),
+        (None, None) => None,
     };
     if id == admin.id && (status.is_some() || role.is_some()) {
         return Err(ApiError::bad_request(
@@ -110,41 +127,41 @@ pub async fn update_user(
             let tx = c.transaction()?;
             let current = tx
                 .query_row(
-                    "SELECT status, role, department, approved_at FROM users WHERE id = ?1",
+                    "SELECT status, role, departments, approved_at FROM users_with_access WHERE id = ?1",
                     params![id],
                     |r| {
                         Ok((
                             r.get::<_, String>(0)?,
                             r.get::<_, String>(1)?,
-                            r.get::<_, Option<String>>(2)?,
+                            access::from_row(r, 2)?,
                             r.get::<_, Option<i64>>(3)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((cur_status, cur_role, cur_dept, approved_at)) = current else {
+            let Some((cur_status, cur_role, cur_departments, approved_at)) = current else {
                 return Ok(Err(ApiError::not_found("User tidak ditemukan.")));
             };
 
             let new_status = status.unwrap_or(cur_status.clone());
             let new_role = role.unwrap_or(cur_role.clone());
-            let new_dept = department.unwrap_or(cur_dept.clone());
-            if new_status == "active" && new_role == "user" && new_dept.is_none() {
+            if new_status == "active" && cur_status != "active" && new_role == "user"
+                && cur_departments.is_empty() && departments.is_none()
+            {
                 return Ok(Err(ApiError::bad_request(
-                    "Tetapkan departemen dulu sebelum menyetujui user.",
+                    "Pilih akses departemen atau setujui tanpa akses khusus.",
                 )));
             }
 
             let approving = new_status == "active" && approved_at.is_none();
             tx.execute(
-                "UPDATE users SET status = ?1, role = ?2, department = ?3,
-                    approved_at = CASE WHEN ?4 THEN ?5 ELSE approved_at END,
-                    approved_by = CASE WHEN ?4 THEN ?6 ELSE approved_by END
-                 WHERE id = ?7",
+                "UPDATE users SET status = ?1, role = ?2,
+                    approved_at = CASE WHEN ?3 THEN ?4 ELSE approved_at END,
+                    approved_by = CASE WHEN ?3 THEN ?5 ELSE approved_by END
+                 WHERE id = ?6",
                 params![
                     new_status,
                     new_role,
-                    new_dept,
                     approving,
                     now(),
                     admin_id,
@@ -152,7 +169,9 @@ pub async fn update_user(
                 ],
             )?;
             // Perubahan hak akses berlaku segera: sesi lama dihapus.
-            if new_status != cur_status || new_role != cur_role || new_dept != cur_dept {
+            if let Some(departments) = departments.filter(|d| *d != cur_departments) {
+                access::replace(&tx, id, &departments)?;
+            } else if new_status != cur_status || new_role != cur_role {
                 tx.execute("DELETE FROM sessions WHERE user_id = ?1", params![id])?;
             }
             tx.commit()?;
@@ -174,11 +193,9 @@ pub async fn reset_password(
     // Body JSON wajib (boleh `{}`), sama seperti semua request yang mengubah data.
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<ResetResult>, ApiError> {
+    reject_system_account(id)?;
     let temporary = temporary_password();
-    let pw = temporary.clone();
-    let hash = tokio::task::spawn_blocking(move || hash_password(&pw))
-        .await
-        .map_err(anyhow::Error::from)??;
+    let hash = hash_blocking(temporary.clone()).await?;
     let found = state
         .db
         .call(move |c| {
@@ -201,6 +218,13 @@ pub async fn reset_password(
 }
 
 /// 14 karakter tanpa huruf yang mudah tertukar (0/O, 1/l/I).
+fn reject_system_account(id: i64) -> Result<(), ApiError> {
+    if id == crate::archive::SYSTEM_ID {
+        return Err(ApiError::not_found("User tidak ditemukan."));
+    }
+    Ok(())
+}
+
 fn temporary_password() -> String {
     use rand::RngExt;
     const CHARS: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";

@@ -30,9 +30,21 @@ pub(crate) struct OrtEmbedder {
     prepooled: bool,
     dim: usize,
     pooling: Pooling,
+    /// Token yang sudah diproses, tanpa padding.
+    tokens: i64,
+    batches: i64,
 }
 
 impl OrtEmbedder {
+    pub(crate) fn usage(&self) -> crate::usage::Usage {
+        crate::usage::Usage {
+            input: self.tokens,
+            requests: self.batches,
+            reported: self.batches,
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn open(
         folder: &Path,
         model: &Model,
@@ -171,6 +183,8 @@ impl OrtEmbedder {
             prepooled,
             dim: model.dim,
             pooling: model.pooling,
+            tokens: 0,
+            batches: 0,
         })
     }
 }
@@ -298,6 +312,8 @@ impl OrtEmbedder {
             );
             pool(values, &mask, width, self.dim, self.pooling)?
         };
+        self.tokens += encodings.iter().map(|e| e.len() as i64).sum::<i64>();
+        self.batches += 1;
         rows.into_iter()
             .zip(encodings)
             .map(|(row, encoding)| Ok((normalize(row)?, !encoding.get_overflowing().is_empty())))

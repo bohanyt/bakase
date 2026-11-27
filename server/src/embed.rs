@@ -352,7 +352,7 @@ fn update_index(
 ) -> Result<()> {
     let mut open = Some(open);
     let mut encoder = None;
-    store::update(
+    let result = store::update(
         &model.store_dir(data),
         model,
         index,
@@ -365,5 +365,9 @@ fn update_index(
             }
             encoder.as_mut().unwrap().embed_counted(texts)
         },
-    )
+    );
+    if let Some(encoder) = encoder {
+        crate::usage::record_command(data, crate::usage::EMBED, encoder.usage());
+    }
+    result
 }

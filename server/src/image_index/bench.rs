@@ -71,7 +71,7 @@ async fn eg2_search_stay_fast() -> Result<()> {
         email: String::new(),
         name: String::new(),
         role: Role::Admin,
-        department: None,
+        departments: vec![],
     };
     let queue_deadline = || tokio::time::Instant::now() + live::SEARCH_DEADLINE;
     let mut normalized = Vec::new();

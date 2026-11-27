@@ -1,7 +1,7 @@
 //! Satu pertanyaan cepat tanpa login dari halaman masuk.
 //!
-//! Tanpa dokumen, tanpa tool, tanpa riwayat, dan tidak disimpan. Dibatasi per perangkat
-//! dan total per jam, karena setiap pertanyaan memakai kuota Azure.
+//! Tanpa dokumen, tool, atau riwayat untuk model. Jalur dengan pemberitahuan arsip
+//! mencatat giliran tanpa identitas perangkat. Kuota tetap per perangkat dan total.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -18,11 +18,13 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::error::ApiError;
+use crate::turn_trace::{self, Status};
 
 pub const MAX_CHARS: usize = 1_000;
 const WINDOW_SECS: i64 = 3_600;
 /// Termasuk token reasoning; dengan effort rendah cukup untuk jawaban sekitar 150 kata.
 const MAX_OUTPUT_TOKENS: u32 = 1_500;
+const EFFORT: &str = "low";
 /// Batas waktu satu jawaban, termasuk menunggu Azure.
 const DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -118,6 +120,21 @@ pub async fn chat(
     State(state): State<Arc<AppState>>,
     req: Request,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    chat_impl(state, req, false).await
+}
+
+pub async fn archived_chat(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    chat_impl(state, req, true).await
+}
+
+async fn chat_impl(
+    state: Arc<AppState>,
+    req: Request,
+    archive_notice: bool,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     if !state.guest.enabled {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -165,16 +182,37 @@ pub async fn chat(
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(64);
+    let mut trace = if archive_notice {
+        state.traces.guest(&message, state.llm.deployment())
+    } else {
+        turn_trace::Turn::default()
+    };
+    let request = state.llm.request(json!([{ "role": "user", "content": message }]), json!({
+        "instructions": PROMPT, "reasoning": { "effort": EFFORT }, "max_output_tokens": MAX_OUTPUT_TOKENS,
+    }), true);
+    trace.begin_model("guest", &request);
     let task_state = state.clone();
     tokio::spawn(async move {
-        let mut wrote = false;
+        let mut text = String::new();
         let mut usage = crate::usage::Usage::default();
-        let answered = tokio::time::timeout(
-            DEADLINE,
-            answer(&task_state, message, &tx, &mut wrote, &mut usage),
-        )
-        .await
-        .unwrap_or_else(|_| Err("waktu habis".into()));
+        let answered = tokio::select! {
+            reply = tokio::time::timeout(DEADLINE, answer(&task_state, request, &tx, &mut text, &mut usage, &mut trace)) => {
+                reply.unwrap_or_else(|_| Err("waktu habis".into()))
+            }
+            () = crate::stop_requested(task_state.chat_shutdown.clone()) => {
+                trace.finish(Status::Stopped, Some("shutdown"), &text, "");
+                crate::usage::record(&task_state.db, "tamu", None, None, usage).await;
+                return;
+            }
+        };
+        let (status, reason) = match answered.as_ref().map_err(String::as_str) {
+            Ok(()) if text.is_empty() => (Status::Failed, Some("no_answer")),
+            Ok(()) => (Status::Ok, None),
+            Err(CLOSED) => (Status::Stopped, Some("client_disconnected")),
+            Err("waktu habis") => (Status::Failed, Some("timeout")),
+            Err(_) => (Status::Failed, Some("model_or_stream_error")),
+        };
+        trace.finish(status, reason, &text, "");
         crate::usage::record(&task_state.db, "tamu", None, None, usage).await;
         match answered {
             Ok(()) => {
@@ -183,7 +221,7 @@ pub async fn chat(
             Err(reason) if reason == CLOSED => {}
             Err(reason) => {
                 tracing::warn!("pertanyaan tamu berhenti: {reason}");
-                let message = if wrote {
+                let message = if !text.is_empty() {
                     crate::STREAM_ERROR_MESSAGE
                 } else {
                     crate::REQUEST_ERROR_MESSAGE
@@ -204,25 +242,20 @@ pub async fn chat(
 const CLOSED: &str = "browser menutup koneksi";
 
 /// Mengalirkan jawaban ke browser. Error berisi alasan untuk log, tanpa isi pertanyaan atau
-/// jawaban; `wrote` menandai sudah ada teks yang terkirim.
+/// jawaban. Teks parsial dikumpulkan sebelum pengiriman event.
 async fn answer(
     state: &AppState,
-    message: String,
+    request: serde_json::Value,
     tx: &tokio::sync::mpsc::Sender<Event>,
-    wrote: &mut bool,
+    text: &mut String,
     usage: &mut crate::usage::Usage,
+    trace: &mut turn_trace::Turn,
 ) -> Result<(), String> {
-    let input = json!([{ "role": "user", "content": message }]);
-    let extra = json!({
-        "instructions": PROMPT,
-        "reasoning": { "effort": "low" },
-        "max_output_tokens": MAX_OUTPUT_TOKENS,
-    });
     // Dihitung sebelum dikirim: permintaan yang terputus sebelum Azure menjawab tetap
     // berbiaya. Yang tidak pernah sampai ke Azure ikut terhitung, tanpa token yang dilaporkan.
     usage.start_request();
     let stream = tokio::select! {
-        s = state.llm.respond_stream(input, extra) => {
+        s = state.llm.respond_stream(&request) => {
             s.map_err(|e| format!("permintaan ke model gagal: {}", crate::llm::error_summary(&e)))?
         }
         _ = tx.closed() => return Err(CLOSED.into()),
@@ -244,7 +277,8 @@ async fn answer(
                 if delta.is_empty() {
                     continue;
                 }
-                *wrote = true;
+                text.push_str(delta);
+                trace.delta("model_text", None, delta);
                 let data = json!({ "text": delta }).to_string();
                 if tx
                     .send(Event::default().event("delta").data(data))
@@ -254,12 +288,15 @@ async fn answer(
                     return Err(CLOSED.into());
                 }
             }
+            "response.created" => trace.model_metadata(&event["response"]),
             "response.completed" => {
+                trace.model_metadata(&event["response"]);
                 usage.add_response(&event["response"]);
                 return Ok(());
             }
             "response.failed" | "response.incomplete" | "error" => {
                 // Respons yang gagal atau terpotong tetap memakai token.
+                trace.model_metadata(&event["response"]);
                 usage.add_response(&event["response"]);
                 return Err(crate::agent::describe_failure(&event));
             }

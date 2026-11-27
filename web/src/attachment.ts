@@ -22,6 +22,7 @@ const GROUPS: Record<string, Group> = {
   pdf: "pdf",
   docx: "office",
   xlsx: "office",
+  xlsm: "office",
   xls: "office",
   pptx: "office",
   txt: "text",
@@ -46,7 +47,7 @@ export function checkFile(name: string, size: number): string | null {
   const ext = extensionOf(name);
   const group = GROUPS[ext];
   if (!group) {
-    return "Jenis file ini belum bisa dilampirkan. Yang bisa: gambar (PNG, JPG, WebP, GIF), PDF, Word (.docx), Excel (.xlsx, .xls), PowerPoint (.pptx), dan teks (.txt, .csv, .md).";
+    return "Jenis file ini belum bisa dilampirkan. Yang bisa: gambar (PNG, JPG, WebP, GIF), PDF, Word (.docx), Excel (.xlsx, .xlsm, .xls), PowerPoint (.pptx), dan teks (.txt, .csv, .md).";
   }
   if (size === 0) return "File ini kosong.";
   if (group === "image" && size > MAX_IMAGE) return "Gambar terlalu besar. Maksimal 10 MB per gambar.";

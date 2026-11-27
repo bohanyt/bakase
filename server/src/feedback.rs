@@ -157,6 +157,7 @@ pub struct FeedbackRow {
     user_name: String,
     user_email: String,
     user_department: Option<String>,
+    user_departments: Vec<String>,
     user_role: String,
     /// Hanya terisi untuk feedback milik admin yang melihat: percakapan user lain
     /// tetap privat, admin hanya melihat yang sengaja mereka bagikan.
@@ -187,9 +188,9 @@ pub async fn admin_list(
             let mut stmt = c.prepare(
                 "SELECT f.id, f.rating, f.reason, f.comment, f.shared_question, f.shared_answer,
                         f.created_at, u.name, u.email, u.department, u.role,
-                        c.id, c.title, CASE WHEN c.id IS NOT NULL THEN f.message_id END
+                        c.id, c.title, CASE WHEN c.id IS NOT NULL THEN f.message_id END, u.departments
                  FROM feedback f
-                 JOIN users u ON u.id = f.user_id
+                 JOIN users_with_access u ON u.id = f.user_id
                  LEFT JOIN messages m ON m.id = f.message_id
                  LEFT JOIN conversations c
                         ON c.id = m.conversation_id AND c.user_id = f.user_id AND f.user_id = ?1
@@ -212,6 +213,7 @@ pub async fn admin_list(
                         conversation_id: r.get(11)?,
                         conversation_title: r.get(12)?,
                         message_id: r.get(13)?,
+                        user_departments: crate::access::from_row(r, 14)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;

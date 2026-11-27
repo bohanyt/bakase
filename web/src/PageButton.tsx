@@ -54,7 +54,8 @@ export function PageButton({
     setStatus(null);
     try {
       const page = await requestPage(from, (text) => alive.current && setStatus(text));
-      if (draft.isAlive()) draft.add(pageFiles(page, new Date()), false, page.snapshotId);
+      // File Excel asli tidak membawa teks halaman, jadi fokusnya ikut sebagai catatan lampiran.
+      if (draft.isAlive()) draft.add(pageFiles(page, new Date()), false, page.snapshotId, page.file ? page.focus : undefined);
     } catch (e) {
       if (alive.current) onError(e instanceof Error ? e.message : "Halaman tidak bisa dibaca.");
     } finally {

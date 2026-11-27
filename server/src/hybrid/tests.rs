@@ -25,7 +25,7 @@ fn person() -> AuthUser {
         id: 1,
         name: "Uji".into(),
         email: String::new(),
-        department: Some("Operasional".into()),
+        departments: vec!["Operasional".into()],
         role: Role::User,
     }
 }
@@ -213,6 +213,7 @@ async fn semantic_filters_access_before_ranking_and_cites_semantic_only_content(
             db: state.db.clone(),
             user: person(),
             sources: state.sources.clone(),
+            session: None,
         }),
     };
     let call = ToolCall {

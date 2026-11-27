@@ -13,6 +13,8 @@ export default defineConfig({
   // Folder public/ milik web tidak ikut ke extension.
   publicDir: false,
   resolve: {
+    // Komentar path di bundel tetap sama walau node_modules berupa symlink (worktree).
+    preserveSymlinks: true,
     // Sumbernya di luar web/, jadi node_modules di sini ditunjuk langsung.
     alias: { "dom-accessibility-api": here("./node_modules/dom-accessibility-api/dist/index.mjs") },
   },

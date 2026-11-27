@@ -13,6 +13,11 @@ use serde_json::Value;
 use crate::{AppState, auth::AdminUser, config::PricingConfig, db::Db, error::ApiError};
 
 pub const INGEST_VISION: &str = "ingest_vision";
+pub const LABEL_SCAN: &str = "label_scan";
+/// Perintah terminal yang memanggil model: `tanya` dan `cek-vision`.
+pub const TERMINAL: &str = "terminal";
+/// Token yang diproses model embedding lokal. Tanpa biaya, jadi tidak ikut total.
+pub const EMBED: &str = "embed";
 
 /// Jumlah token dari satu atau beberapa respons Responses API.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -76,32 +81,50 @@ pub async fn record(
     if usage.requests == 0 {
         return;
     }
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let result = db
-        .call(move |c| {
-            c.execute(
-                "INSERT INTO usage_log (created_at, kind, user_id, message_id, input_tokens,
-                 cached_tokens, output_tokens, reasoning_tokens, requests, reported_requests)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                rusqlite::params![
-                    now,
-                    kind,
-                    user_id,
-                    message_id,
-                    usage.input,
-                    usage.cached,
-                    usage.output,
-                    usage.reasoning,
-                    usage.requests,
-                    usage.reported
-                ],
-            )?;
-            Ok(())
-        })
+        .call(move |c| Ok(insert(c, kind, user_id, message_id, usage)?))
         .await;
     if let Err(e) = result {
         tracing::warn!("gagal mencatat pemakaian token: {e:#}");
     }
+}
+
+/// Untuk perintah terminal. Database tidak dibuat kalau server belum pernah jalan di sini.
+pub fn record_command(data_dir: &std::path::Path, kind: &'static str, usage: Usage) {
+    if usage.requests == 0 || !Db::exists(data_dir) {
+        return;
+    }
+    let result = Db::open(data_dir)
+        .and_then(|db| db.call_blocking(|c| Ok(insert(c, kind, None, None, usage)?)));
+    if result.is_err() {
+        println!("Pemakaian token gagal dicatat.");
+    }
+}
+
+fn insert(
+    c: &rusqlite::Connection,
+    kind: &str,
+    user_id: Option<i64>,
+    message_id: Option<i64>,
+    usage: Usage,
+) -> rusqlite::Result<usize> {
+    c.execute(
+        "INSERT INTO usage_log (created_at, kind, user_id, message_id, input_tokens,
+         cached_tokens, output_tokens, reasoning_tokens, requests, reported_requests)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            crate::db::now(),
+            kind,
+            user_id,
+            message_id,
+            usage.input,
+            usage.cached,
+            usage.output,
+            usage.reasoning,
+            usage.requests,
+            usage.reported
+        ],
+    )
 }
 
 /// Hari dan bulan laporan mengikuti WIB.
@@ -175,6 +198,7 @@ pub struct UserUsage {
     pub name: Option<String>,
     pub email: Option<String>,
     pub department: Option<String>,
+    pub departments: Vec<String>,
     pub kind: String,
     #[serde(flatten)]
     pub totals: Totals,
@@ -197,6 +221,10 @@ pub struct Report {
     /// Biaya terbesar dulu.
     pub users: Vec<UserUsage>,
     pub ingest: Option<Totals>,
+    pub label_scan: Option<Totals>,
+    pub terminal: Option<Totals>,
+    /// Tanpa biaya dan di luar `total`.
+    pub embed: Option<Totals>,
     pub pricing: Pricing,
     /// Kosong kalau kurs belum pernah berhasil diambil dan tidak ada kurs cadangan.
     pub rate: Option<crate::fx::Rate>,
@@ -244,11 +272,11 @@ pub async fn admin_report(
         .call(move |c| {
             // Satu transaksi baca: slot lain bisa mencatat pemakaian di tengah laporan, dan
             // tanpa snapshot yang sama total per user bisa melebihi total bulan.
-            let tx = c.transaction()?;
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
             let months = tx
                 .prepare(&format!(
                     "SELECT strftime('%Y-%m', created_at + {WIB_SECS}, 'unixepoch') AS m, {SUMS}
-                     FROM usage_log GROUP BY m ORDER BY m DESC LIMIT 12"
+                     FROM usage_log WHERE kind <> '{EMBED}' GROUP BY m ORDER BY m DESC LIMIT 12"
                 ))?
                 .query_map([], |r| {
                     Ok((r.get::<_, String>(0)?, Totals::from_row(r, 1)?))
@@ -257,7 +285,7 @@ pub async fn admin_report(
             let days = tx
                 .prepare(&format!(
                     "SELECT strftime('%Y-%m-%d', created_at + {WIB_SECS}, 'unixepoch') AS d, {SUMS}
-                     FROM usage_log WHERE created_at >= ?1 AND created_at < ?2
+                     FROM usage_log WHERE created_at >= ?1 AND created_at < ?2 AND kind <> '{EMBED}'
                      GROUP BY d ORDER BY d"
                 ))?
                 .query_map([from, to], |r| {
@@ -266,8 +294,8 @@ pub async fn admin_report(
                 .collect::<Result<Vec<_>, _>>()?;
             let users = tx
                 .prepare(&format!(
-                    "SELECT l.user_id, u.name, u.email, u.department, l.kind, {SUMS}
-                     FROM usage_log l LEFT JOIN users u ON u.id = l.user_id
+                    "SELECT l.user_id, u.name, u.email, u.department, l.kind, COALESCE(u.departments, '[]'), {SUMS}
+                     FROM usage_log l LEFT JOIN users_with_access u ON u.id = l.user_id
                      WHERE l.created_at >= ?1 AND l.created_at < ?2
                      GROUP BY l.kind, l.user_id"
                 ))?
@@ -277,8 +305,9 @@ pub async fn admin_report(
                         name: r.get(1)?,
                         email: r.get(2)?,
                         department: r.get(3)?,
+                        departments: crate::access::from_row(r, 5)?,
                         kind: r.get(4)?,
-                        totals: Totals::from_row(r, 5)?,
+                        totals: Totals::from_row(r, 6)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -297,11 +326,21 @@ pub async fn admin_report(
         total.add(&d.totals);
     }
     let mut ingest = Totals::default();
+    let mut label_scan = Totals::default();
+    let mut terminal = Totals::default();
+    let mut embed = Totals::default();
     let mut users: Vec<UserUsage> = users
         .into_iter()
         .filter_map(|mut u| {
-            if u.kind == INGEST_VISION {
-                ingest.add(&u.totals);
+            let shared = match u.kind.as_str() {
+                INGEST_VISION => Some(&mut ingest),
+                LABEL_SCAN => Some(&mut label_scan),
+                TERMINAL => Some(&mut terminal),
+                EMBED => Some(&mut embed),
+                _ => None,
+            };
+            if let Some(shared) = shared {
+                shared.add(&u.totals);
                 return None;
             }
             u.totals = u.totals.priced(p);
@@ -316,6 +355,9 @@ pub async fn admin_report(
         days,
         users,
         ingest: (ingest.requests > 0).then(|| ingest.priced(p)),
+        label_scan: (label_scan.requests > 0).then(|| label_scan.priced(p)),
+        terminal: (terminal.requests > 0).then(|| terminal.priced(p)),
+        embed: (embed.requests > 0).then_some(embed),
         pricing: Pricing {
             input_usd: p.input_usd,
             cached_input_usd: p.cached_input_usd,
@@ -383,6 +425,31 @@ mod tests {
                 reported: 2
             }
         );
+    }
+
+    #[test]
+    fn commands_record_only_into_an_existing_database() {
+        let dir = std::env::temp_dir().join(format!("rag-hub-usage-{}", rand::random::<u64>()));
+        let mut usage = Usage::default();
+        usage.start_request();
+        record_command(&dir, TERMINAL, usage);
+        assert!(
+            !dir.exists(),
+            "database tidak dibuat oleh perintah terminal"
+        );
+        let db = Db::open(&dir).unwrap();
+        record_command(&dir, TERMINAL, usage);
+        record_command(&dir, EMBED, Usage::default());
+        let kinds = db
+            .call_blocking(|c| {
+                let mut stmt = c.prepare("SELECT kind FROM usage_log")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(kinds, [TERMINAL]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

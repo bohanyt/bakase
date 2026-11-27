@@ -5,7 +5,7 @@ import { CiteContext } from "./citeContext";
 import { FileIcon } from "./FileIcon";
 import type { FileRef } from "./messages";
 import { isImageKind } from "./attachment";
-import { columnName, markdownTable, rangeA1, rangeBounds, type CellPos } from "./quote";
+import { columnName, edgeScrollStep, markdownTable, rangeA1, rangeBounds, type CellPos } from "./quote";
 import { DocumentText } from "./SourcePreview";
 
 /** Potong ke `max` karakter (code point, bukan satuan UTF-16), dengan elipsis. */
@@ -149,12 +149,49 @@ function SheetPreview({ spec, fileName }: { spec: XlsxSpec; fileName: string }) 
   const statusId = useId();
 
   useEffect(() => {
+    let point: { x: number; y: number } | null = null;
+    let frame = 0;
+    // Seret sampai tepi: tabel ikut bergulir dan pilihan melebar ke sel di bawah kursor,
+    // seperti Excel. Berhenti saat tombol dilepas atau tabel sudah mentok.
+    const step = () => {
+      frame = 0;
+      const wrap = wrapRef.current;
+      if (!dragging.current || !wrap || !point) return;
+      const r = wrap.getBoundingClientRect();
+      const left = r.left + wrap.clientLeft;
+      const top = r.top + wrap.clientTop;
+      const right = left + wrap.clientWidth;
+      const bottom = top + wrap.clientHeight;
+      // Nomor baris dan judul kolom menempel, jadi tepi sel yang terlihat ada di balik keduanya.
+      const start = left + (wrap.querySelector<HTMLElement>("thead .rownum")?.offsetWidth ?? 0);
+      const head = top + (wrap.querySelector<HTMLElement>("thead")?.offsetHeight ?? 0);
+      const dx = edgeScrollStep(point.x, start, right);
+      const dy = edgeScrollStep(point.y, head, bottom);
+      const x0 = wrap.scrollLeft;
+      const y0 = wrap.scrollTop;
+      if (dx || dy) wrap.scrollBy({ left: dx, top: dy, behavior: "instant" });
+      if (wrap.scrollLeft === x0 && wrap.scrollTop === y0) return;
+      const x = Math.min(Math.max(point.x, start + 1), right - 2);
+      const y = Math.min(Math.max(point.y, head + 1), bottom - 2);
+      const pos = cellAt(document.elementFromPoint(x, y));
+      if (pos) setSel((s) => (s && !samePos(s.focus, pos) ? { anchor: s.anchor, focus: pos } : s));
+      frame = requestAnimationFrame(step);
+    };
+    const move = (e: PointerEvent) => {
+      if (!dragging.current) return;
+      point = { x: e.clientX, y: e.clientY };
+      if (!frame) frame = requestAnimationFrame(step);
+    };
     const up = () => {
       dragging.current = false;
+      point = null;
     };
+    window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
     window.addEventListener("pointercancel", up);
     return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       window.removeEventListener("pointercancel", up);
     };

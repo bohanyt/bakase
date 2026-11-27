@@ -3,6 +3,9 @@ import { ClipboardTextIcon, FileXlsIcon, MagnifyingGlassIcon } from "@phosphor-i
 import { api, type AuthOptions, type User } from "./api";
 import { GuestAsk } from "./GuestAsk";
 import { Mascot } from "./Mascot";
+import { MicrosoftAuth } from "./MicrosoftAuth";
+import { microsoftParams, microsoftResult } from "./microsoftLogin";
+import { inPanel } from "./pageBridge";
 import { SupportLink } from "./SupportLink";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -12,16 +15,32 @@ const HINTS = [
   { icon: FileXlsIcon, text: "Buatkan file Excel dan Word" },
 ];
 
-export function AuthScreen({ onLogin }: { onLogin: (user: User) => void }) {
+export function AuthScreen({ options, onLogin, note, panelTabReady = false }: {
+  options: AuthOptions | null | undefined;
+  /** Kenapa layar ini muncul, misalnya sesi berakhir di tengah kerja. */
+  note?: string;
+  onLogin: (user: User) => void;
+  panelTabReady?: boolean;
+}) {
   const [mode, setMode] = useState<"login" | "register">("login");
-  const [options, setOptions] = useState<AuthOptions | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  const { pilot, tab, result } = microsoftParams();
+  const panel = inPanel();
+  const full = options?.microsoft === "full";
+  const microsoft = full || (options?.microsoft === "pilot" && pilot);
+  const initial = panelTabReady ? "done" : tab && result === "done" ? "expired" : microsoftResult(result);
+  const showMicrosoft = microsoft || initial !== null;
+  const panelLayout = showMicrosoft && panel;
+  const hideVisual = showMicrosoft && (panel || tab);
+
   useEffect(() => {
-    api<AuthOptions>("/api/auth/options").then(setOptions, () => setOptions(null));
-  }, []);
+    if (!tab) return;
+    const theme = new URLSearchParams(location.search).get("ms_theme");
+    if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
+  }, [tab]);
 
   function switchMode(next: "login" | "register") {
     setMode(next);
@@ -29,6 +48,10 @@ export function AuthScreen({ onLogin }: { onLogin: (user: User) => void }) {
   }
 
   function focusLogin() {
+    if (showMicrosoft) {
+      (document.querySelector("[data-microsoft-primary]") as HTMLElement | null)?.focus();
+      return;
+    }
     switchMode("login");
     requestAnimationFrame(() => document.getElementById("login-email")?.focus());
   }
@@ -65,8 +88,65 @@ export function AuthScreen({ onLogin }: { onLogin: (user: User) => void }) {
 
   const domain = options?.email_domain ?? "example.com";
 
+  const passwordForm = (
+    <form className="auth-form" onSubmit={submit} key={mode}>
+      {notice && <p className="notice">{notice}</p>}
+      {error && <p className="form-error" role="status">{error}</p>}
+      {mode === "register" && (
+        <label>
+          Nama lengkap
+          <input id="reg-name" name="name" required autoComplete="name" />
+        </label>
+      )}
+      <label>
+        Email kantor
+        <input
+          id={mode + "-email"}
+          name="email"
+          type="email"
+          required
+          autoComplete={full ? "off" : "email"}
+          placeholder={"nama@" + domain}
+        />
+      </label>
+      <label>
+        Password
+        <input
+          id={mode + "-password"}
+          name="password"
+          type="password"
+          required
+          minLength={mode === "register" ? 10 : undefined}
+          autoComplete={full ? "off" : mode === "login" ? "current-password" : "new-password"}
+        />
+      </label>
+      {mode === "register" && (
+        <>
+          <label>
+            Ulangi password
+            <input id="reg-password2" name="password2" type="password" required autoComplete="new-password" />
+          </label>
+          <label>
+            Departemen
+            <select id="reg-department" name="department" defaultValue="">
+              <option value="">Pilih departemen</option>
+              {options?.departments.map((d) => <option key={d} value={d}>{d}</option>)}
+            </select>
+          </label>
+          <p className="auth-note">
+            Pakai password baru khusus Hub, minimal 10 karakter. Jangan pakai password Windows atau email
+            kantor. Akun bisa dipakai setelah disetujui admin.
+          </p>
+        </>
+      )}
+      <button className={"auth-submit" + (full ? " ms-action" : "")} type="submit" disabled={busy}>
+        {busy ? "Sebentar..." : full ? "Masuk sebagai admin" : mode === "login" ? "Masuk" : "Kirim pendaftaran"}
+      </button>
+    </form>
+  );
+
   return (
-    <div className="auth">
+    <div className={"auth" + (showMicrosoft ? " auth-microsoft" : "") + (hideVisual ? " auth-microsoft-single" : "") + (panelLayout ? " auth-microsoft-panel" : "")}>
       <div className="auth-theme">
         <SupportLink whatsapp={options?.support_whatsapp} />
         <ThemeToggle />
@@ -80,83 +160,41 @@ export function AuthScreen({ onLogin }: { onLogin: (user: User) => void }) {
 
         <div className="auth-body">
           <Mascot className="auth-mascot-small" asset="welcome" placement="loginSmall" />
-          <h1 className="auth-title">Tanya, cari, beres.</h1>
-          <p className="auth-lead">Bakase membantu mencari dan merangkum dokumen kerja, serta membuat file Excel dan Word.</p>
+          <h1 className="auth-title">{panelLayout ? "Bakase" : "Tanya, cari, beres."}</h1>
+          {!hideVisual && <p className="auth-lead">Bakase membantu mencari dan merangkum dokumen kerja, serta membuat file Excel dan Word.</p>}
 
-          <div className="auth-card">
-            <div className="auth-tabs" role="tablist" aria-label="Masuk atau daftar">
-              <button type="button" role="tab" aria-selected={mode === "login"} onClick={() => switchMode("login")}>
-                Masuk
-              </button>
-              <button type="button" role="tab" aria-selected={mode === "register"} onClick={() => switchMode("register")}>
-                Daftar
-              </button>
-            </div>
-
-            {notice && <p className="notice">{notice}</p>}
-            {error && <p className="form-error">{error}</p>}
-
-            <form className="auth-form" onSubmit={submit} key={mode}>
-              {mode === "register" && (
-                <label>
-                  Nama lengkap
-                  <input id="reg-name" name="name" required autoComplete="name" />
-                </label>
+          {(showMicrosoft || options !== undefined) && (
+            <div className="auth-card">
+              {note && <p className="auth-note" role="status">{note}</p>}
+              {showMicrosoft && (
+                <MicrosoftAuth pilot={pilot} panel={panel} tab={tab} initial={initial} visible={microsoft} legacyMessage={full && !panel && !tab} onLogin={onLogin}>
+                  {full && !panel && !tab && (
+                    <details className="ms-admin">
+                      <summary className="ms-text">Masuk dengan password (admin)</summary>
+                      {passwordForm}
+                    </details>
+                  )}
+                </MicrosoftAuth>
               )}
-              <label>
-                Email kantor
-                <input
-                  id={`${mode}-email`}
-                  name="email"
-                  type="email"
-                  required
-                  autoComplete="email"
-                  placeholder={`nama@${domain}`}
-                />
-              </label>
-              <label>
-                Password
-                <input
-                  id={`${mode}-password`}
-                  name="password"
-                  type="password"
-                  required
-                  minLength={mode === "register" ? 10 : undefined}
-                  autoComplete={mode === "login" ? "current-password" : "new-password"}
-                />
-              </label>
-              {mode === "register" && (
+              {!full && !initial && !hideVisual && (
                 <>
-                  <label>
-                    Ulangi password
-                    <input id="reg-password2" name="password2" type="password" required autoComplete="new-password" />
-                  </label>
-                  <label>
-                    Departemen
-                    <select id="reg-department" name="department" defaultValue="">
-                      <option value="">Pilih departemen</option>
-                      {options?.departments.map((d) => (
-                        <option key={d} value={d}>
-                          {d}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <p className="auth-note">
-                    Pakai password baru khusus Hub, minimal 10 karakter. Jangan pakai password Windows atau email
-                    kantor. Akun bisa dipakai setelah disetujui admin.
-                  </p>
+                  <div className="auth-tabs" role="tablist" aria-label="Masuk atau daftar">
+                    <button type="button" role="tab" aria-selected={mode === "login"} onClick={() => switchMode("login")}>
+                      Masuk
+                    </button>
+                    <button type="button" role="tab" aria-selected={mode === "register"} onClick={() => switchMode("register")}>
+                      Daftar
+                    </button>
+                  </div>
+                  {passwordForm}
                 </>
               )}
-              <button className="auth-submit" type="submit" disabled={busy}>
-                {busy ? "Sebentar..." : mode === "login" ? "Masuk" : "Kirim pendaftaran"}
-              </button>
-            </form>
-          </div>
+            </div>
+          )}
         </div>
       </main>
 
-      {options?.guest ? (
+      {!hideVisual && (options?.guest ? (
         <aside className="auth-visual" aria-label="Tanya tanpa login">
           <GuestAsk onWantLogin={focusLogin} />
         </aside>
@@ -175,7 +213,7 @@ export function AuthScreen({ onLogin }: { onLogin: (user: User) => void }) {
             </ul>
           </div>
         </aside>
-      )}
+      ))}
     </div>
   );
 }

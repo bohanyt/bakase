@@ -17,7 +17,10 @@ use crate::{
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use eg2::{Encoder, Prepared, Tokens};
+#[cfg(test)]
+pub(crate) use extract::tests::pdf_with_image;
 use extract::{Counts, Kind};
+pub(crate) use extract::{allowed_size, safe_pdf_image};
 use image::RgbImage;
 pub(crate) use live::{Access, Live, Picture, SEARCH_DEADLINE, thumbnail_route};
 use rusqlite::{Connection, OpenFlags};

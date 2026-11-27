@@ -7,8 +7,9 @@ use crate::config::{Config, SourceConfig};
 use crate::db::{self, Db};
 use crate::docdate;
 use crate::llm::Llm;
+use crate::scan;
 use crate::search::{self, DocIndex, INDEX_TABLE, INDEX_VERSION, NewChunk};
-use crate::usage::{self, Usage};
+use crate::usage;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use rusqlite::{TransactionBehavior, params};
@@ -26,8 +27,11 @@ const MIN_CHUNK_CHARS: usize = 200;
 /// Batas potongan per file, supaya satu spreadsheet raksasa tidak memenuhi index.
 const MAX_CHUNKS_PER_DOC: usize = 3_000;
 pub(crate) const MAX_FILE_BYTES: u64 = 150 * 1024 * 1024;
-/// Batas sel per spreadsheet saat dibaca.
+/// Batas sel per spreadsheet saat dibaca (jumlah kotak semua sheet). Ingest berjalan di proses
+/// server tanpa batas memori, jadi tetap 2 juta. Lampiran dibaca di proses pembaca yang
+/// dibatasi 1 GB, dengan batas yang sama seperti pemeriksaan sel lampiran.
 const MAX_TABLE_CELLS: usize = 2_000_000;
+const MAX_ATTACHMENT_TABLE_CELLS: usize = 4_000_000;
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(180);
 /// File yang dibaca bersamaan.
 const PARALLEL: usize = 4;
@@ -35,10 +39,6 @@ const PARALLEL: usize = 4;
 const COMMIT_EVERY: usize = 50;
 /// PDF dengan rata-rata huruf per halaman di bawah ini kemungkinan hasil scan.
 pub(crate) const SCAN_CHARS_PER_PAGE: usize = 30;
-
-/// File yang dikirim ke model paling besar sekian.
-const MAX_VISION_BYTES: u64 = 20 * 1024 * 1024;
-const VISION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Instruksi untuk model saat membaca gambar dan PDF hasil scan. Hasilnya hanya masuk
 /// index, tidak pernah dicetak.
@@ -71,12 +71,32 @@ pub mod status {
 // dengan status yang sama diproses lagi oleh ingest biasa.
 pub const NAME_ONLY_VERSION: i64 = INDEX_VERSION + 2;
 
-fn indexed_version(ext: &str, state: &str, has_chunks: bool) -> i64 {
+fn indexed_version(ext: &str, state: &str, has_chunks: bool, pages: u32) -> i64 {
     match state {
+        status::ARCHIVE if ext == "pdf" && pages == 1 => INDEX_VERSION + 4,
+        status::OK | status::EMPTY | status::FAILED | status::ARCHIVE if ext == "xls" => {
+            INDEX_VERSION + 3
+        }
         status::OK | status::VISION | status::ARCHIVE => content_version(ext),
         status::SCAN if has_chunks => content_version(ext),
         _ => NAME_ONLY_VERSION,
     }
+}
+
+#[test]
+fn xls_archive_fallback_gets_the_same_new_version_as_native_text() {
+    assert_eq!(
+        indexed_version("xls", status::ARCHIVE, true, 0),
+        INDEX_VERSION + 3
+    );
+    assert_eq!(
+        indexed_version("xls", status::OK, true, 0),
+        INDEX_VERSION + 3
+    );
+    assert_eq!(
+        indexed_version("xlsx", status::ARCHIVE, true, 0),
+        INDEX_VERSION + 1
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,7 +227,10 @@ struct Extracted {
     /// Tanggal diubah dan dibuat dari metadata file.
     modified: Option<time::Date>,
     created: Option<time::Date>,
+    scan_labels: Vec<(u32, scan::Kinds)>,
 }
+
+const XLS_PREPARATION_FAILED: &str = "xls_preparation_failed";
 
 impl Extracted {
     fn skipped(status: &'static str) -> Self {
@@ -218,6 +241,7 @@ impl Extracted {
             truncated: false,
             modified: None,
             created: None,
+            scan_labels: Vec::new(),
         }
     }
 
@@ -254,6 +278,19 @@ async fn extract_file(path: PathBuf, ext: String, size: u64) -> Extracted {
         // Xberg tidak membaca metadata file Office lama.
         let legacy = matches!(ext.as_str(), "xls" | "doc" | "ppt")
             .then(|| docdate::legacy_office(&bytes, today));
+        let bytes = if ext == "xls" {
+            let Some(prepared) =
+                tokio::task::spawn_blocking(move || crate::attachments::xls::prepare_source(bytes))
+                    .await
+                    .ok()
+                    .flatten()
+            else {
+                return Extracted::skipped(XLS_PREPARATION_FAILED);
+            };
+            prepared
+        } else {
+            bytes
+        };
         let Some(read) = extract_with_xberg(bytes, &ext, true).await else {
             return Extracted::skipped(status::FAILED);
         };
@@ -287,7 +324,11 @@ pub(crate) fn xberg_config(embedded: bool) -> xberg::ExtractionConfig {
         // Batas bawaan 100 ribu sel menolak spreadsheet operasional yang wajar. Isinya
         // tetap dibatasi MAX_CHUNKS_PER_DOC saat dipotong.
         security_limits: Some(xberg::SecurityLimits {
-            max_table_cells: MAX_TABLE_CELLS,
+            max_table_cells: if embedded {
+                MAX_TABLE_CELLS
+            } else {
+                MAX_ATTACHMENT_TABLE_CELLS
+            },
             // Lampiran user: PDF atau presentasi dengan ribuan halaman ditolak sebelum
             // halamannya dibaca.
             max_pages: (!embedded).then_some(MAX_ATTACHMENT_PAGES),
@@ -414,6 +455,7 @@ fn build(kind: Kind, pages: u32, sections: Vec<(Option<u32>, String)>) -> Extrac
         truncated,
         modified: None,
         created: None,
+        scan_labels: Vec::new(),
     }
 }
 
@@ -683,14 +725,14 @@ async fn load_existing(
     .await
 }
 
-struct Job {
+struct Job<'a> {
     path: PathBuf,
     rel: String,
     size: i64,
     mtime: i64,
     modified: Option<SystemTime>,
     id: Option<i64>,
-    carry: Option<(i64, i64, u32)>,
+    carry: Option<(&'a DocIndex, i64, i64, u32)>,
     /// Teks hasil baca ARCHIVE untuk file ini, kalau ada.
     sidecar: Option<PathBuf>,
     sidecar_print: i64,
@@ -711,6 +753,7 @@ struct RowUpdate {
     sidecar: i64,
     /// Tanggal dokumen `YYYY-MM-DD` dan asalnya, kalau diketahui.
     doc_date: Option<(String, &'static str)>,
+    scan_labels: Vec<(u32, scan::Kinds)>,
 }
 
 /// Hak akses dan folder asal satu sumber, seperti yang dipakai ingest ini. Server hanya
@@ -725,7 +768,7 @@ struct Label {
 async fn insert_pending(
     db: &Db,
     source: &str,
-    job: &Job,
+    job: &Job<'_>,
     previous_id: Option<i64>,
     title: &str,
     kind: &str,
@@ -803,6 +846,9 @@ async fn save_rows(db: &Db, rows: Vec<RowUpdate>, label: &Label) -> Result<()> {
                     r.doc_date.as_ref().map(|(_, from)| *from),
                     DATE_VERSION
                 ])?;
+                for (page, kinds) in &r.scan_labels {
+                    scan::save_page(&tx, r.id, *page, r.pages, kinds)?;
+                }
             }
         }
         tx.commit()?;
@@ -925,6 +971,11 @@ async fn ingest_documents(cfg: &Config, rebuild: bool, vision: Option<&Llm>) -> 
         !cfg.sources.is_empty(),
         "Belum ada [[sources]] di config.toml; contohnya ada di config.example.toml."
     );
+    if let Some((a, b)) = cfg.nested_sources() {
+        anyhow::bail!(
+            "Folder sumber {a} dan {b} bertumpuk, jadi satu file bisa mendapat dua label hak akses. Pisahkan foldernya di config.toml."
+        );
+    }
 
     let _lock = ingest_lock(&cfg.data_dir)?;
     let index_dir = search::version_dir(&cfg.data_dir, INDEX_VERSION);
@@ -968,8 +1019,9 @@ async fn ingest_documents(cfg: &Config, rebuild: bool, vision: Option<&Llm>) -> 
     };
     // Baris lama juga menyediakan ID untuk file yang belum pernah diproses v4.
     let legacy = load_existing(&db, "documents").await?;
-    let index = DocIndex::open_current(&index_dir, building)?;
+    let index = DocIndex::open_for_ingest(&index_dir, building)?;
     let mut writer = index.writer()?;
+    search::remove_stale_temps(&index_dir);
 
     let started = Instant::now();
     let mut summary = Summary::default();
@@ -1176,6 +1228,14 @@ async fn ingest_source(
             .and_then(|n| n.to_str())
             .and_then(archive_id8)
             .and_then(|id8| uploads.get(id8).copied());
+        let legacy_row = legacy.get(&key).filter(|row| row.status != status::PENDING);
+        // Label dicek juga untuk file yang tidak berubah: baris v3 dipakai lagi kalau slot lama
+        // dihidupkan. Saat index baru dibangun, baris itu masih dibutuhkan untuk hasil OCR-nya.
+        let relabeled =
+            !building && legacy_row.is_some_and(|row| row.visibility != label.visibility);
+        if relabeled {
+            stale.push(key.clone());
+        }
         if let Some(row) = old
             && row.size == size
             && row.mtime == mtime
@@ -1183,7 +1243,7 @@ async fn ingest_source(
             && (!uses_sidecar(&row.status) || row.sidecar == stored_print(&row.status, sidecar_print))
             && row.visibility == label.visibility
             && row.root == label.root
-            && row.version == indexed_version(&extension(&path), &row.status, row.chunks > 0)
+            && row.version == indexed_version(&extension(&path), &row.status, row.chunks > 0, row.pages)
             && row.status != status::PENDING
             // Tanggal dokumen dari aturan lama, atau baris yang sempat ditulis ulang tanpa tanggal:
             // baca ulang sekali. Hasil baca model tidak dibaca ulang hanya untuk tanggal, karena ingest tanpa
@@ -1201,12 +1261,35 @@ async fn ingest_source(
             counts.status(&row.status);
             continue;
         }
-        if legacy
-            .get(&key)
-            .is_some_and(|row| row.size != size || row.mtime != mtime || row.root != label.root)
+        if !relabeled
+            && legacy_row
+                .is_some_and(|row| row.size != size || row.mtime != mtime || row.root != label.root)
         {
             stale.push(key.clone());
         }
+        // Perubahan label bisa memakai teks OCR yang sudah ada untuk file yang sama.
+        let carry = if building {
+            previous.zip(legacy.get(&key))
+        } else {
+            Some(index).zip(old).filter(|(_, row)| {
+                row.visibility != label.visibility
+                    && row.version
+                        == indexed_version(
+                            &extension(&path),
+                            &row.status,
+                            row.chunks > 0,
+                            row.pages,
+                        )
+            })
+        }
+        .filter(|(_, row)| {
+            row.status == status::VISION
+                && modified.is_some()
+                && row.size == size
+                && row.mtime == mtime
+                && row.root == label.root
+        })
+        .map(|(index, row)| (index, row.id, row.chunks, row.pages));
         jobs.push(Job {
             path,
             rel,
@@ -1214,16 +1297,7 @@ async fn ingest_source(
             mtime,
             modified,
             id: old.map(|r| r.id),
-            carry: legacy
-                .get(&key)
-                .filter(|row| {
-                    row.status == status::VISION
-                        && modified.is_some()
-                        && row.size == size
-                        && row.mtime == mtime
-                        && row.root == label.root
-                })
-                .map(|row| (row.id, row.chunks, row.pages)),
+            carry,
             sidecar,
             sidecar_print,
             uploaded,
@@ -1236,10 +1310,8 @@ async fn ingest_source(
         let mut job = job;
         let ext = extension(&job.path);
         let size = u64::try_from(job.size).unwrap_or(u64::MAX);
-        let carried = match (previous, job.carry) {
-            (Some(previous), Some((id, chunks, pages))) => {
-                carry_vision(previous, id, chunks, pages)?
-            }
+        let carried = match job.carry {
+            Some((index, id, chunks, pages)) => carry_vision(index, id, chunks, pages)?,
             _ => None,
         };
         let mut extracted = match carried {
@@ -1251,7 +1323,7 @@ async fn ingest_source(
         if uses_sidecar(extracted.status)
             && let Some(sidecar) = job.sidecar.clone()
         {
-            match read_sidecar(&sidecar, extracted.pages).await {
+            match read_sidecar(&sidecar, &ext, extracted.pages).await {
                 SidecarRead::Text(read) => extracted = read.dated_like(&extracted),
                 SidecarRead::Unusable => {}
                 // Sidik tidak disimpan, supaya ingest berikutnya mencoba lagi.
@@ -1264,6 +1336,10 @@ async fn ingest_source(
                 llm.respond(input, extra).await
             })
             .await
+            && job
+                .path
+                .metadata()
+                .is_ok_and(|meta| file_stamp(&meta) == (job.size, job.mtime))
         {
             extracted = read.dated_like(&extracted);
         }
@@ -1273,8 +1349,27 @@ async fn ingest_source(
 
     let mut pending: Vec<RowUpdate> = Vec::new();
     while let Some(result) = results.next().await {
-        let (job, ext, extracted) = result?;
-        let version = indexed_version(&ext, extracted.status, !extracted.chunks.is_empty());
+        let (job, ext, mut extracted) = result?;
+        if extracted.status == XLS_PREPARATION_FAILED {
+            if let Some(old) = existing.get(&(source.name.clone(), job.rel.clone()))
+                && old.chunks > 0
+                && matches!(old.status.as_str(), status::OK | status::ARCHIVE)
+                && old.visibility == label.visibility
+                && old.root == label.root
+            {
+                counts.read += 1;
+                counts.chunks += usize::try_from(old.chunks).unwrap_or(0);
+                counts.status(&old.status);
+                continue;
+            }
+            extracted.status = status::FAILED;
+        }
+        let version = indexed_version(
+            &ext,
+            extracted.status,
+            !extracted.chunks.is_empty(),
+            extracted.pages,
+        );
         let title = title_of(&job.path);
         let date = document_date(&title, &ext, &extracted).or_else(|| {
             job.uploaded.map(|date| docdate::DocDate {
@@ -1338,6 +1433,7 @@ async fn ingest_source(
             mtime: job.mtime,
             sidecar: stored_print(extracted.status, job.sidecar_print),
             doc_date: date.map(|d| (d.date.to_string(), d.from)),
+            scan_labels: extracted.scan_labels,
         });
         if pending.len() >= COMMIT_EVERY {
             writer.commit()?;
@@ -1499,8 +1595,8 @@ enum SidecarRead {
     Failed,
 }
 
-/// Teks ARCHIVE sebagai isi dokumen, dipotong seperti file teks, tanpa nomor halaman.
-async fn read_sidecar(path: &Path, pages: u32) -> SidecarRead {
+/// Teks ARCHIVE hanya punya letak yang pasti kalau PDF aslinya terdiri dari satu halaman.
+async fn read_sidecar(path: &Path, ext: &str, pages: u32) -> SidecarRead {
     use tokio::io::AsyncReadExt;
     let Ok(file) = tokio::fs::File::open(path).await else {
         return SidecarRead::Failed;
@@ -1521,12 +1617,12 @@ async fn read_sidecar(path: &Path, pages: u32) -> SidecarRead {
     if text.trim().is_empty() {
         return SidecarRead::Unusable;
     }
-    let mut read = build(Kind::Text, 0, vec![(None, text)]);
+    let page = (ext == "pdf" && pages == 1).then_some(1);
+    let mut read = build(Kind::Text, pages, vec![(page, text)]);
     if read.chunks.is_empty() {
         return SidecarRead::Unusable;
     }
     read.status = status::ARCHIVE;
-    read.pages = pages;
     SidecarRead::Text(read)
 }
 
@@ -1535,7 +1631,7 @@ fn carry_vision(index: &DocIndex, id: i64, chunks: i64, pages: u32) -> Result<Op
         id: 0,
         email: String::new(),
         name: String::new(),
-        department: None,
+        departments: vec![],
         role: crate::acl::Role::Admin,
     };
     let Some((total, hits)) = index.document_chunks(id, &admin, 0, MAX_CHUNKS_PER_DOC)? else {
@@ -1554,6 +1650,7 @@ fn carry_vision(index: &DocIndex, id: i64, chunks: i64, pages: u32) -> Result<Op
         truncated: false,
         modified: None,
         created: None,
+        scan_labels: Vec::new(),
     }))
 }
 
@@ -1575,50 +1672,88 @@ async fn read_with_vision(
     path: &Path,
     ext: &str,
     size: u64,
-    respond: impl AsyncFnOnce(serde_json::Value, serde_json::Value) -> Result<serde_json::Value>,
+    respond: impl AsyncFn(serde_json::Value, serde_json::Value) -> Result<serde_json::Value>,
 ) -> Option<Extracted> {
-    use base64::Engine;
-    if size > MAX_VISION_BYTES || (ext != "pdf" && vision_image_mime(ext).is_none()) {
+    if size > scan::MAX_BYTES {
         return None;
     }
-    let bytes = read_limited(path, MAX_VISION_BYTES).await?;
-    let part = if ext == "pdf" {
-        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-        serde_json::json!({ "type": "input_file", "filename": format!("dokumen.{ext}"),
-            "file_data": format!("data:application/pdf;base64,{data}") })
+    let bytes = read_limited(path, scan::MAX_BYTES).await?;
+    let pdf = ext == "pdf";
+    let (pages, images) = if pdf {
+        match scan::pdf_pages(bytes.clone(), Default::default(), usize::MAX, true).await {
+            Ok(pages) if pages.images.iter().all(|(_, image)| image.is_some()) => {
+                (pages.total, pages.images)
+            }
+            _ => return read_pdf_with_vision(db, bytes, respond).await,
+        }
     } else {
-        let mime = vision_image_mime(ext)?;
-        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-        serde_json::json!({ "type": "input_image", "image_url": format!("data:{mime};base64,{data}") })
+        (
+            1,
+            vec![(1, Some(scan::direct_image(vision_image_mime(ext)?, bytes)?))],
+        )
     };
-    let input = serde_json::json!([{ "role": "user", "content": [
-        { "type": "input_text", "text": "Baca dokumen ini." },
-        part,
-    ]}]);
+    let respond = &respond;
+    // Hasil sebagian tidak dipakai, jadi sesudah satu halaman gagal sisanya tidak diminta.
+    let stop = &std::sync::atomic::AtomicBool::new(false);
+    let mut results = futures::stream::iter(images.into_iter().map(|(page, image)| async move {
+        use std::sync::atomic::Ordering::Relaxed;
+        if stop.load(Relaxed) {
+            return None;
+        }
+        let read = async {
+            let (text, usage) =
+                scan::image_request(image?, scan::ReadMode::Transcribe, respond).await;
+            usage::record(db, usage::INGEST_VISION, None, None, usage).await;
+            let mut result: scan::Transcript = serde_json::from_str(&text?).ok()?;
+            scan::deduplicate(&mut result.jenis);
+            Some((page, result))
+        }
+        .await;
+        if read.is_none() {
+            stop.store(true, Relaxed);
+        }
+        read
+    }))
+    .buffered(2);
+    let mut labels = Vec::new();
+    let mut sections = Vec::new();
+    let mut failed = false;
+    while let Some(result) = results.next().await {
+        if let Some((page, result)) = result {
+            sections.push((pdf.then_some(page), result.teks));
+            labels.push((page, result.jenis));
+        } else {
+            failed = true;
+        }
+    }
+    let mut read = build(Kind::Office, pages, sections);
+    if failed || read.chunks.is_empty() {
+        return None;
+    }
+    read.status = status::VISION;
+    read.scan_labels = labels;
+    Some(read)
+}
+
+async fn read_pdf_with_vision(
+    db: &Db,
+    bytes: Vec<u8>,
+    respond: impl AsyncFn(serde_json::Value, serde_json::Value) -> Result<serde_json::Value>,
+) -> Option<Extracted> {
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let part = serde_json::json!({ "type": "input_file", "filename": "dokumen.pdf",
+        "file_data": format!("data:application/pdf;base64,{data}") });
     let extra = serde_json::json!({
         "instructions": VISION_INSTRUCTIONS,
         "reasoning": { "effort": "low" },
         "max_output_tokens": 16_000,
     });
-    let mut usage = Usage::default();
-    usage.start_request();
-    let response = tokio::time::timeout(VISION_TIMEOUT, respond(input, extra))
-        .await
-        .ok()
-        .and_then(Result::ok);
-    if let Some(response) = &response {
-        usage.add_response(response);
-    }
+    let (response, usage) = scan::request(part, extra, respond).await;
     usage::record(db, usage::INGEST_VISION, None, None, usage).await;
     let response = response?;
-    if response["status"]
-        .as_str()
-        .is_some_and(|s| s != "completed")
-    {
-        return None;
-    }
     let text = crate::agent::output_text(&response);
-    let sections = vision_sections(&text, ext == "pdf");
+    let sections = vision_sections(&text, true);
     let pages = sections.iter().filter_map(|(p, _)| *p).max().unwrap_or(0);
     let mut read = build(Kind::Office, pages, sections);
     if read.chunks.is_empty() {
@@ -1630,7 +1765,7 @@ async fn read_with_vision(
 
 /// Isi file, atau `None` kalau lebih dari `max` byte. Ukuran dicek saat membaca, karena
 /// file bisa membesar sejak dipindai.
-async fn read_limited(path: &Path, max: u64) -> Option<Vec<u8>> {
+pub(crate) async fn read_limited(path: &Path, max: u64) -> Option<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let file = tokio::fs::File::open(path).await.ok()?;
     let mut bytes = Vec::new();
@@ -2142,16 +2277,16 @@ mod tests {
         let blank = dir.join("kosong.md");
         fs::write(&blank, "  \n\t").unwrap();
         assert!(matches!(
-            read_sidecar(&blank, 0).await,
+            read_sidecar(&blank, "pdf", 0).await,
             SidecarRead::Unusable
         ));
         assert!(matches!(
-            read_sidecar(&dir.join("tidak-ada.md"), 0).await,
+            read_sidecar(&dir.join("tidak-ada.md"), "pdf", 0).await,
             SidecarRead::Failed
         ));
         let text = dir.join("isi.md");
         fs::write(&text, "Teks hasil baca ARCHIVE.").unwrap();
-        match read_sidecar(&text, 3).await {
+        match read_sidecar(&text, "pdf", 3).await {
             SidecarRead::Text(read) => {
                 assert_eq!(read.status, status::ARCHIVE);
                 assert_eq!(read.pages, 3);
@@ -2230,7 +2365,21 @@ mod tests {
             hits[0].text,
             "Hasil baca ARCHIVE: jumlah barang belum cocok."
         );
-        assert_eq!(hits[0].page, None);
+        assert_eq!(hits[0].page, Some(1));
+        let chunk_id = hits[0].chunk_id.clone();
+        let db = Db::open(&cfg.data_dir).unwrap();
+        db.call(|c| {
+            Ok(c.execute(
+                "UPDATE documents_v4 SET version = ?1 WHERE rel_path = '0a1b2c3d_scan.pdf'",
+                [INDEX_VERSION],
+            )?)
+        })
+        .await
+        .unwrap();
+        assert_eq!(run(&cfg, false, None).await.unwrap().read, 1);
+        let hit = &search("cocok")[0];
+        assert_eq!(hit.page, Some(1));
+        assert_eq!(hit.chunk_id, chunk_id);
         assert!(
             search("dipakai").is_empty(),
             "file yang terbaca sendiri tidak memakai teks ARCHIVE"
@@ -2245,7 +2394,7 @@ mod tests {
         .unwrap();
         assert_eq!(run(&cfg, false, None).await.unwrap().read, 1);
         assert_eq!(rows(&base).await["4e5f6a7b_foto.jpg"].0, status::ARCHIVE);
-        assert_eq!(search("tercecer").len(), 1);
+        assert_eq!(search("tercecer")[0].page, None);
 
         // Teks ARCHIVE yang berubah ikut dibaca ulang.
         fs::write(
@@ -2367,7 +2516,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("rag-hub-vision-{}", rand::random::<u64>()));
         fs::create_dir_all(&base).unwrap();
         let path = base.join("foto.png");
-        fs::write(&path, b"gambar sintetis").unwrap();
+        image::RgbImage::new(2, 2).save(&path).unwrap();
         let db = Db::open(&base).unwrap();
         let server_db = Db::open(&base).unwrap();
 
@@ -2379,18 +2528,23 @@ mod tests {
                     "output_tokens": 10, "output_tokens_details": {"reasoning_tokens": 4}
                 },
                 "output": [{"type": "message", "content": [
-                    {"type": "output_text", "text": "Isi gambar sintetis"}
+                    {"type": "output_text", "text": r#"{"teks":"Isi gambar sintetis","jenis":["centang"]}"#}
                 ]}]
             })
         };
-        let result = read_with_vision(&db, &path, "png", 15, async |input, _| {
+        let result = read_with_vision(&db, &path, "png", 15, async |input, extra| {
             assert_eq!(input[0]["content"][1]["type"], "input_image");
+            assert_eq!(input[0]["content"][1]["detail"], "high");
+            assert!(extra.get("reasoning").is_none());
+            assert_eq!(extra["text"]["format"]["strict"], true);
             Ok(response("completed"))
         })
         .await
         .unwrap();
         assert_eq!(result.status, status::VISION);
         assert_eq!(result.chunks[0].1, "Isi gambar sintetis");
+        assert_eq!(result.chunks[0].0, None);
+        assert_eq!(result.scan_labels, vec![(1, vec![scan::Kind::Centang])]);
 
         assert!(
             read_with_vision(&db, &path, "png", 15, async |_, _| Ok(response(
@@ -2407,13 +2561,9 @@ mod tests {
             .is_none()
         );
         assert!(
-            read_with_vision(
-                &db,
-                &path,
-                "png",
-                MAX_VISION_BYTES + 1,
-                async |_, _| panic!("file terlalu besar tidak dikirim")
-            )
+            read_with_vision(&db, &path, "png", scan::MAX_BYTES + 1, async |_, _| panic!(
+                "file terlalu besar tidak dikirim"
+            ))
             .await
             .is_none()
         );
@@ -2460,6 +2610,86 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    #[tokio::test]
+    async fn ingest_vision_renders_each_pdf_page_and_falls_back_for_jpx() {
+        use serde_json::json;
+        let base = std::env::temp_dir().join(format!("rag-hub-render-{}", rand::random::<u64>()));
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join("lembar.pdf");
+        let db = Db::open_in_memory().unwrap();
+        let completed = |text: &str| {
+            json!({
+                "status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":text}]}]
+            })
+        };
+        let pdf = minimal_pdf(&["Lembar satu", "Lembar dua"]);
+        fs::write(&path, &pdf).unwrap();
+        let read = read_with_vision(&db, &path, "pdf", pdf.len() as u64, async |input, extra| {
+            let image = &input[0]["content"][1];
+            assert_eq!(image["type"], "input_image");
+            assert!(
+                image["image_url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/jpeg;base64,")
+            );
+            assert!(extra["reasoning"].is_null());
+            Ok(completed(
+                r#"{"teks":"Tulisan uji [tulisan tangan: 99].","jenis":["angka"]}"#,
+            ))
+        })
+        .await
+        .unwrap();
+        assert_eq!(read.pages, 2);
+        assert_eq!(
+            read.chunks
+                .iter()
+                .map(|(page, _)| *page)
+                .collect::<Vec<_>>(),
+            [Some(1), Some(2)]
+        );
+        assert_eq!(
+            read.scan_labels,
+            [(1, vec![scan::Kind::Angka]), (2, vec![scan::Kind::Angka])]
+        );
+
+        let jpx = crate::image_index::pdf_with_image(128, 128, "JPXDecode", &[1, 2, 3]);
+        fs::write(&path, &jpx).unwrap();
+        let read = read_with_vision(&db, &path, "pdf", jpx.len() as u64, async |input, extra| {
+            assert_eq!(input[0]["content"][1]["type"], "input_file");
+            assert!(extra["text"].is_null());
+            Ok(completed("=== Halaman 1 ===\nLembar PDF sintetis."))
+        })
+        .await
+        .unwrap();
+        assert_eq!(read.chunks[0].0, Some(1));
+        assert!(read.scan_labels.is_empty());
+
+        // PDF yang terlalu panjang untuk dibaca per halaman tetap memakai jalur utuh.
+        let long = minimal_pdf(&vec!["Lembar"; 101]);
+        fs::write(&path, &long).unwrap();
+        let read = read_with_vision(&db, &path, "pdf", long.len() as u64, async |input, _| {
+            assert_eq!(input[0]["content"][1]["type"], "input_file");
+            Ok(completed("=== Halaman 101 ===\nLembar PDF sintetis."))
+        })
+        .await
+        .unwrap();
+        assert_eq!(read.chunks[0].0, Some(101));
+
+        // Hasil sebagian tidak dipakai, jadi halaman sesudah yang gagal tidak diminta.
+        let pdf = minimal_pdf(&["Lembar"; 10]);
+        fs::write(&path, &pdf).unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let read = read_with_vision(&db, &path, "pdf", pdf.len() as u64, async |_, _| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(completed("bukan JSON"))
+        })
+        .await;
+        assert!(read.is_none());
+        assert!(calls.into_inner() <= 2);
+        let _ = fs::remove_dir_all(base);
+    }
+
     fn test_config(base: &Path, visibility: &str) -> Config {
         let text = format!(
             r#"data_dir = {data:?}
@@ -2475,6 +2705,77 @@ visibility = {visibility}
             docs = base.join("docs").to_string_lossy(),
         );
         toml::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn visibility_change_relabels_cached_ocr_without_calling_vision() {
+        let base =
+            std::env::temp_dir().join(format!("rag-hub-ocr-label-{}", rand::random::<u64>()));
+        fs::create_dir_all(base.join("docs")).unwrap();
+        let cfg = test_config(&base, r#"{ type = "admin" }"#);
+        fs::write(base.join("docs/uji.png"), b"Berkas gambar sintetis").unwrap();
+        run(&cfg, false, None).await.unwrap();
+        let id = rows(&base).await["uji.png"].2;
+        let index = DocIndex::open(&cfg.data_dir).unwrap();
+        let mut writer = index.writer().unwrap();
+        index.delete_document(&writer, id);
+        index
+            .add_chunk(
+                &writer,
+                search::NewChunk {
+                    doc_id: id,
+                    n: 0,
+                    source: "Uji",
+                    title: "uji",
+                    rel_path: "uji.png",
+                    acl: &["admin".into()],
+                    page: Some(1),
+                    text: "Hasil OCR fiktif.",
+                    file_type: "gambar/scan",
+                    years: &[],
+                },
+            )
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        drop(index);
+        let db = Db::open(&cfg.data_dir).unwrap();
+        db.call(move |c| {
+            c.execute(
+                &format!(
+                    "UPDATE {INDEX_TABLE} SET status=?1, version=?2, pages=1, chunks=1 WHERE id=?3"
+                ),
+                params![
+                    status::VISION,
+                    indexed_version("png", status::VISION, true, 0),
+                    id
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let next = test_config(
+            &base,
+            r#"{ type = "departemen", departments = ["Contoh"] }"#,
+        );
+        assert_eq!(run(&next, false, None).await.unwrap().read, 1);
+        assert_eq!(rows(&base).await["uji.png"], (status::VISION.into(), 1, id));
+        let index = DocIndex::open(&cfg.data_dir).unwrap();
+        let sources = ["Uji".to_string()];
+        let hits = index
+            .search("fiktif", &user("Contoh"), &sources, 0, 2, false)
+            .unwrap();
+        assert_eq!(hits[0].text, "Hasil OCR fiktif.");
+        assert!(
+            index
+                .search("fiktif", &user("Review"), &sources, 0, 2, false)
+                .unwrap()
+                .is_empty()
+        );
+        drop((db, index));
+        let _ = fs::remove_dir_all(base);
     }
 
     #[tokio::test]
@@ -2541,7 +2842,7 @@ visibility = {visibility}
             id: 1,
             email: "a@example.com".into(),
             name: "A".into(),
-            department: Some(department.into()),
+            departments: vec![department.into()],
             role: crate::acl::Role::User,
         }
     }
@@ -2557,6 +2858,77 @@ visibility = {visibility}
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unnormalizable_xls_charts_use_archive_or_keep_existing_text() {
+        let base = std::env::temp_dir().join(format!("rag-hub-xls-{}", rand::random::<u64>()));
+        let docs = base.join("docs");
+        let archive = docs.join(ARCHIVE_TEXT_DIR);
+        fs::create_dir_all(&archive).unwrap();
+        let cfg = test_config(&base, r#"{ type = "umum" }"#);
+        let old_name = "lama.xls";
+        let archive_name = "a1234567_uji.xls";
+        let new_name = "baru.xls";
+        let good = crate::attachments::xls_fixture(3, 2);
+        fs::write(docs.join(old_name), &good).unwrap();
+        fs::write(docs.join(archive_name), &good).unwrap();
+        run(&cfg, false, None).await.unwrap();
+        let initial = rows(&base).await;
+        assert_eq!(initial[old_name].0, status::OK);
+        assert_eq!(initial[archive_name].0, status::OK);
+
+        let bad = crate::attachments::xls::rejected_chart_fixture();
+        for name in [old_name, archive_name, new_name] {
+            fs::write(docs.join(name), &bad).unwrap();
+        }
+        fs::write(
+            archive.join("a1234567.md"),
+            "Teks cadangan sintetis yang aman.",
+        )
+        .unwrap();
+        let db = Db::open(&cfg.data_dir).unwrap();
+        db.call(|c| {
+            c.execute(
+                &format!("UPDATE {INDEX_TABLE} SET version = version - 1"),
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        drop(db);
+        run(&cfg, false, None).await.unwrap();
+        let final_rows = rows(&base).await;
+        assert_eq!(final_rows[old_name], initial[old_name]);
+        assert_eq!(final_rows[archive_name].0, status::ARCHIVE);
+        assert_eq!(final_rows[new_name].0, status::FAILED);
+        let index = DocIndex::open(&cfg.data_dir).unwrap();
+        let admin = crate::acl::AuthUser {
+            id: 0,
+            email: String::new(),
+            name: String::new(),
+            departments: vec![],
+            role: crate::acl::Role::Admin,
+        };
+        let text = |name: &str| {
+            let (_, hits) = index
+                .document_chunks(final_rows[name].2, &admin, 0, MAX_CHUNKS_PER_DOC)
+                .unwrap()
+                .unwrap_or_default();
+            hits.into_iter()
+                .map(|(_, hit)| hit.text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(text(old_name).contains('5'));
+        assert!(text(archive_name).contains("Teks cadangan sintetis"));
+        assert!(text(new_name).is_empty());
+        for name in [old_name, archive_name, new_name] {
+            assert!(!text(name).contains("9811"));
+        }
+        drop(index);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[tokio::test]
@@ -2624,7 +2996,22 @@ visibility = {visibility}
             Ok(c.last_insert_rowid())
         }).await.unwrap();
         assert!(next_legacy_id > new_id);
+        let legacy = load_existing(&db, "documents").await.unwrap();
+        assert_eq!(
+            legacy[&("Uji".into(), "tetap.txt".into())].status,
+            status::OK
+        );
 
+        // Label baris v3 tertinggal, sedangkan file dan baris barunya tidak berubah.
+        db.call(|c| {
+            c.execute(
+                "UPDATE documents SET visibility = '{\"type\":\"admin\"}' WHERE rel_path = 'tetap.txt'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         fs::write(docs.join("ubah.txt"), "dokumen uji sudah diubah").unwrap();
         fs::remove_file(docs.join("hapus.txt")).unwrap();
         assert_eq!(
@@ -2635,15 +3022,38 @@ visibility = {visibility}
             }
         );
         let legacy = load_existing(&db, "documents").await.unwrap();
-        for file in ["ubah.txt", "hapus.txt", "hanya-v3.txt"] {
+        for file in ["ubah.txt", "hapus.txt", "hanya-v3.txt", "tetap.txt"] {
             assert_eq!(legacy[&("Uji".into(), file.into())].status, status::PENDING);
         }
-        assert_eq!(
-            legacy[&("Uji".into(), "tetap.txt".into())].status,
-            status::OK
-        );
         drop(db);
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn nested_sources_stop_ingest_before_anything_is_written() {
+        let base = std::env::temp_dir().join(format!("rag-hub-nested-{}", rand::random::<u64>()));
+        let mut cfg = test_config(
+            &base,
+            r#"{ type = "departemen", departments = ["Review"] }"#,
+        );
+        let inner = cfg.sources[0].path.join("bagian");
+        fs::create_dir_all(&inner).unwrap();
+        for path in [inner, cfg.sources[0].path.join("bagian").join("..")] {
+            cfg.sources.truncate(1);
+            cfg.sources.push(SourceConfig {
+                name: "Semua".into(),
+                path,
+                visibility: crate::acl::Visibility::Umum,
+            });
+            let error = run(&cfg, false, None).await.unwrap_err().to_string();
+            assert!(error.contains("Uji dan Semua bertumpuk"), "{error}");
+            assert!(!cfg.data_dir.exists());
+        }
+        // Nama yang hanya berawalan sama bukan folder di dalamnya.
+        cfg.sources[1].path = base.join("docs-lain");
+        fs::create_dir_all(&cfg.sources[1].path).unwrap();
+        assert_eq!(cfg.nested_sources(), None);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]

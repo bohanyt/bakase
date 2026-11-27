@@ -6,7 +6,7 @@ import type { FileRef, SourceRef } from "./messages";
  * seluruh teks satu dokumen dari Sumber Data. */
 export type PreviewTarget =
   | { type: "file"; file: FileRef }
-  | { type: "source"; source: SourceRef }
+  | { type: "source"; source: SourceRef; originalPage?: number }
   | { type: "document"; document: DocumentItem };
 
 /** Membuka panel preview kanan. Disediakan oleh Shell. */
@@ -20,7 +20,7 @@ export function previewKey(target: PreviewTarget): string {
     case "file":
       return `file:${target.file.id}`;
     case "source":
-      return `source:${target.source.chunk_id}`;
+      return `source:${target.source.chunk_id}:${target.originalPage ?? ""}`;
     case "document":
       return `document:${target.document.id}`;
   }

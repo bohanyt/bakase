@@ -39,7 +39,7 @@ fn principal() -> AuthUser {
         id: 0,
         email: String::new(),
         name: String::new(),
-        department: None,
+        departments: vec![],
         role: Role::Admin,
     }
 }

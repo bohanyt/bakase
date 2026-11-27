@@ -411,6 +411,7 @@ impl Live {
                             source(doc, entry.hash, &reference.location, similar),
                             path,
                             reference.location.clone(),
+                            doc.clone(),
                         ));
                         break;
                     }
@@ -428,8 +429,17 @@ impl Live {
                 break;
             }
         }
+        let labels = crate::scan::labels(
+            access.db,
+            access.index.table(),
+            found.iter().map(|(_, _, _, doc)| doc),
+        )
+        .await
+        .unwrap_or_default();
+        let labels = &labels;
         Ok(futures::future::join_all(found.into_iter().map(
-            |(mut hit, path, location)| async move {
+            |(mut hit, path, location, doc)| async move {
+                hit.handwriting = crate::scan::handwriting(&doc, labels.get(&doc.id), hit.page);
                 if matches!(hit.kind.as_str(), "pptx" | "xlsx") {
                     let placement = async {
                         let _permit = self.decode.acquire().await.ok()?;
@@ -697,6 +707,9 @@ fn source(doc: &DocumentRow, hash: store::Hash, location: &str, similar: bool) -
         source: doc.source.clone(),
         kind: doc.kind.clone(),
         page,
+        scan: crate::scan::is_scan(&doc.status, &doc.kind),
+        handwriting: None,
+        scan_rev: crate::scan::revision(doc),
         sheet: None,
         evidence_only: false,
         image: Some(Picture {

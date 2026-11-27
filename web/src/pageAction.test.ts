@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { limitPageText, pageActionTiming, readActionReply, readPageAction } from "./pageAction.ts";
+import { limitPageText, pageActionTiming, readActionReply, readPageAction, readTableProgress } from "./pageAction.ts";
 
 const id = "a".repeat(32);
 const remaining_ms = 7500;
@@ -34,11 +34,27 @@ test("sisa waktu aksi sama saat jam laptop berbeda 15 detik dari server", (t) =>
   const clock = { timeOrigin: serverTime - 200, now: () => 200 };
   for (const skew of [-15000, 15000]) {
     const date = t.mock.method(Date, "now", () => serverTime + skew);
-    assert.deepEqual(pageActionTiming(7500, clock), { timeout: 7500, deadline: 7700 });
-    assert.equal(pageActionTiming(12000, clock).timeout, 8000);
-    assert.equal(pageActionTiming(0, clock).timeout, 0);
+    const action = { id, action: "sorot", ref: "e1" } as const;
+    assert.deepEqual(pageActionTiming({ ...action, remaining_ms: 7500 }, clock), { timeout: 7500, deadline: 7700 });
+    assert.equal(pageActionTiming({ ...action, remaining_ms: 12000 }, clock).timeout, 8000);
+    assert.equal(pageActionTiming({ ...action, remaining_ms: 0 }, clock).timeout, 0);
+    assert.equal(pageActionTiming({ ...action, action: "ambil_tabel", remaining_ms: 65000 }, clock).timeout, 62000);
     date.mock.restore();
   }
+});
+
+test("hasil tabel harus cocok dengan jumlah kolom, batas byte, dan alasan yang dikenal", () => {
+  const table = { title: "Contoh", columns: ["A"], rows: [["=1+1"]], issues: [] };
+  const reply = { id, type: "app:hasil-aksi", status: "table", table };
+  assert.deepEqual(readActionReply(reply, id), { status: "table", table });
+  for (const patch of [
+    { rows: [["a", "b"]] }, { rows: [[42]] }, { rows: [["字".repeat(3000)]] },
+    { issues: ["arbitrary"] }, { rows: Array.from({ length: 300 }, () => ["a".repeat(7000)]) },
+  ]) assert.deepEqual(readActionReply({ ...reply, table: { ...table, ...patch } }, id), { status: "failed" });
+  const progress = { id, type: "app:progres", rows: 320 };
+  assert.equal(readTableProgress(progress, id), 320);
+  assert.equal(readTableProgress(progress, "lain"), null);
+  assert.equal(readTableProgress({ ...progress, rows: 5001 }, id), null);
 });
 
 test("balasan hanya untuk ID aksi yang sama dan isi gulir dibatasi dalam byte", () => {

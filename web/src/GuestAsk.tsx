@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { ArrowUpIcon, SignInIcon } from "@phosphor-icons/react";
 import { Streamdown } from "streamdown";
+import { ERROR_MODE, realStatus } from "./api";
 import { BlockedImage } from "./BlockedImage";
 import { Mascot } from "./Mascot";
 import { saveFollowUp } from "./guestFollowUp";
@@ -34,14 +35,15 @@ export function GuestAsk({ onWantLogin }: { onWantLogin: () => void }) {
     const controller = new AbortController();
     abort.current = controller;
     try {
-      const res = await fetch("/api/guest/chat", {
+      const res = await fetch("/api/guest/chat/archive-v1", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...ERROR_MODE, "Content-Type": "application/json" },
         body: JSON.stringify({ message: question }),
         signal: controller.signal,
       });
-      if (!res.ok || !res.body) {
-        let message = `Server menjawab ${res.status}.`;
+      const status = realStatus(res.status, res.headers.get("X-app-Status"));
+      if (status < 200 || status >= 300 || !res.body) {
+        let message = `Server menjawab ${status}.`;
         try {
           const data = await res.json();
           if (typeof data?.message === "string") message = data.message;
@@ -135,7 +137,7 @@ export function GuestAsk({ onWantLogin }: { onWantLogin: () => void }) {
             </button>
           ))}
         </div>
-        <p className="hint">Tanpa login, Bakase tidak membuka dokumen kantor dan percakapan tidak disimpan.</p>
+        <p className="hint">Tanpa login, Bakase tidak membuka dokumen kantor. Pertanyaan dan jawaban disimpan di arsip IT.</p>
       </div>
     );
   }

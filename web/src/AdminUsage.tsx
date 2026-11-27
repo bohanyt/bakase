@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api } from "./api";
+import { api, departmentList } from "./api";
 
 type Totals = {
   turns: number;
@@ -17,6 +17,7 @@ type UserUsage = Totals & {
   name: string | null;
   email: string | null;
   department: string | null;
+  departments?: string[];
   kind: string;
 };
 type Report = {
@@ -26,6 +27,9 @@ type Report = {
   days: Period[];
   users: UserUsage[];
   ingest: Totals | null;
+  label_scan?: Totals | null;
+  terminal?: Totals | null;
+  embed?: Totals | null;
   pricing: { input_usd: number; cached_input_usd: number; output_usd: number };
   rate: { usd_idr: number; date: string | null; source: "otomatis" | "config" } | null;
 };
@@ -181,18 +185,20 @@ export function AdminUsage() {
     key: `${u.kind}-${u.user_id ?? "tamu"}`,
     label: userLabel(u),
     email: u.name ? u.email : null,
-    department: u.kind === "tamu" ? "–" : (u.department ?? "Tanpa departemen"),
+    department: u.kind === "tamu" ? "–" : (departmentList(u.departments, u.department).join(", ") || "Tanpa departemen"),
     totals: u,
   }));
-  if (report.ingest) {
-    rows.push({
-      key: "ingest_vision",
-      label: "Baca scan dan foto (ingest)",
-      email: null,
-      department: "–",
-      totals: report.ingest,
-    });
+  // Pemakaian bersama, bukan milik satu user.
+  const shared: [string, string, Totals | null | undefined][] = [
+    ["ingest_vision", "Baca scan dan foto (ingest)", report.ingest],
+    ["label_scan", "Label scan", report.label_scan],
+    ["terminal", "Pas Building (perintah terminal)", report.terminal],
+    ["embed", "Embedding (lokal, tanpa biaya)", report.embed],
+  ];
+  for (const [key, label, totals] of shared) {
+    if (totals) rows.push({ key, label, email: null, department: "–", totals });
   }
+  const sharedKeys = new Set(shared.map(([key]) => key));
   const cachedShare = t.input > 0 ? Math.round((t.cached / t.input) * 100) : 0;
   const unreported = t.requests - t.reported;
   // Bulan berjalan dan bulan yang sedang tampil selalu bisa dipilih, walau belum ada pemakaian.
@@ -304,9 +310,9 @@ export function AdminUsage() {
                       {email && <div className="muted small">{email}</div>}
                     </td>
                     <td>{department}</td>
-                    <td className="num">{key === "ingest_vision" ? "–" : whole.format(totals.turns)}</td>
+                    <td className="num">{sharedKeys.has(key) ? "–" : whole.format(totals.turns)}</td>
                     <td className="num">{compact.format(totals.input)}</td>
-                    <td className="num">{compact.format(totals.output)}</td>
+                    <td className="num">{key === "embed" ? "–" : compact.format(totals.output)}</td>
                     <td className="num">{money(totals.cost_usd)}</td>
                     <td className="num">
                       {t.cost_usd > 0 ? `${Math.round((totals.cost_usd / t.cost_usd) * 100)}%` : "–"}

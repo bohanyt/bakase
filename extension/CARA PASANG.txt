@@ -1,0 +1,18 @@
+Pasang Bakase
+
+File ZIP tidak perlu diekstrak.
+
+Microsoft Edge
+1. Buka edge://extensions dan nyalakan Developer mode (Mode pengembang).
+2. Seret file ZIP ke halaman itu.
+3. Klik ikon puzzle, sematkan Bakase, lalu klik Bakase dan masuk dengan akun
+   Microsoft kantor.
+Kalau Edge menawarkan "Turn off extensions", pilih "Not now".
+
+Google Chrome
+1. Buka chrome://extensions dan nyalakan Developer mode (Mode developer).
+2. Seret file ZIP ke halaman itu.
+3. Klik ikon Bakase di kanan atas dan masuk dengan akun Microsoft kantor.
+
+Untuk memperbarui, unduh ZIP terbaru dari menu Bantuan di Bakase, lalu seret ke
+halaman yang sama.

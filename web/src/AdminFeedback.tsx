@@ -1,6 +1,6 @@
 import { ArrowRightIcon, ChatCircleIcon, ThumbsDownIcon, ThumbsUpIcon } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
-import { api } from "./api";
+import { api, departmentList } from "./api";
 import { parseMessage } from "./quote";
 import { fullDateTime } from "./time";
 
@@ -15,6 +15,7 @@ type Item = {
   user_name: string;
   user_email: string;
   user_department: string | null;
+  user_departments?: string[];
   user_role: "user" | "admin";
   /** Hanya terisi untuk feedback milik admin sendiri; chat user lain tetap privat. */
   conversation_id: string | null;
@@ -56,7 +57,7 @@ function FeedbackItem({ f, onOpenChat }: { f: Item; onOpenChat: OpenChat }) {
         </time>
       </div>
       <p className="fb-meta">
-        {f.user_department ?? "Tanpa departemen"} · {f.user_email}
+        {departmentList(f.user_departments, f.user_department).join(", ") || "Tanpa departemen"} · {f.user_email}
       </p>
       {f.comment && <p className="fb-comment">{f.comment}</p>}
       {conversationId && messageId !== null ? (

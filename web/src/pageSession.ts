@@ -1,6 +1,6 @@
 import type { ActionReply, PageAction } from "./pageAction.js";
 
-type Page = { id: string; origin: string; attachmentId?: string; refresh?: { text: string } };
+type Page = { id: string; origin: string; ambilTabel?: true; attachmentId?: string; refresh?: { text: string } };
 export type LivePage = Page & { attachmentId: string };
 
 export function pageChanged(data: unknown, id: string): boolean {
@@ -20,8 +20,8 @@ export function createPageSession() {
   }
 
   return {
-    remember(id: string, origin: string) {
-      latest = { id, origin };
+    remember(id: string, origin: string, ambilTabel?: true) {
+      latest = { id, origin, ...(ambilTabel ? { ambilTabel } : {}) };
     },
     forget,
     changed(origin: string, data: unknown) {
@@ -52,7 +52,7 @@ export function createPageSession() {
         forget(page.id);
         return;
       }
-      if (reply.status === "scrolled" || reply.status === "highlighted") {
+      if (reply.status === "scrolled" || reply.status === "highlighted" || reply.status === "table") {
         if (latest?.id !== page.id) reply = { status: "unavailable" };
         else if (reply.status === "scrolled") latest.refresh = { text: reply.text };
       } else if (reply.status !== "stale_ref") {

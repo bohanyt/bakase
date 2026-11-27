@@ -23,6 +23,15 @@ departments = ["Umum", "Operasional", "Review"]
 # lihat edge://extensions). Kosong: Bakase tidak bisa dipasang di iframe mana pun.
 # extension_ids = ["abcdefghijklmnopabcdefghijklmnop"]
 
+# Login Microsoft opsional. Aktifkan secure_cookie dan ikuti docs/deploy.md sebelum pilot.
+# [auth.microsoft]
+# enabled = false
+# tenant_id = "00000000-0000-0000-0000-000000000000"
+# client_id = "00000000-0000-0000-0000-000000000000"
+# redirect_uri = "https://hub.example.com/api/auth/callback/microsoft"
+# secret_expires = 2027-01-01
+# pilot = []
+
 # Tombol "Ada masalah? Hubungi IT" membuka WhatsApp ke nomor ini (angka dengan kode negara).
 # [support]
 # whatsapp = "6281234567890"
@@ -37,8 +46,8 @@ departments = ["Umum", "Operasional", "Review"]
 # fx_url = "https://api.frankfurter.dev/v1/latest?base=USD&symbols=IDR"
 # fallback_usd_idr = 18000
 
-# Satu pertanyaan cepat tanpa login di halaman masuk. Tanpa dokumen, tanpa file, tidak
-# disimpan. Setiap pertanyaan memakai kuota Azure, jadi dibatasi per perangkat dan total.
+# Satu pertanyaan cepat tanpa dokumen dan file. Halaman dengan pemberitahuan arsip
+# menyimpan pertanyaan dan jawaban tanpa identitas perangkat. Kuota tetap per perangkat dan total.
 # [guest]
 # enabled = true
 # per_device_per_hour = 3

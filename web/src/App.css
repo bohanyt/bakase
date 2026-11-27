@@ -151,6 +151,16 @@ kbd {
   padding: 0 5px;
 }
 
+/* Tampil sebelum JavaScript jalan, hanya kalau muatannya lambat. */
+.boot {
+  visibility: hidden;
+  animation: boot-show 0s 0.4s forwards;
+}
+@keyframes boot-show {
+  to {
+    visibility: visible;
+  }
+}
 .loading {
   display: grid;
   place-items: center;
@@ -607,6 +617,16 @@ body.resizing {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+.msg-error-more {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.answer-note {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
 }
 
 .working,
@@ -1430,6 +1450,48 @@ body.resizing {
   background: var(--hover);
 }
 
+.row-assistant {
+  display: flow-root;
+}
+.page-thumb {
+  float: right;
+  width: 46%;
+  margin: 4px 0 12px 18px;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--side);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.page-thumb:hover {
+  border-color: var(--faint);
+}
+.page-thumb-window {
+  display: block;
+  aspect-ratio: 1 / 1;
+  padding: 8px 8px 0;
+  overflow: hidden;
+}
+.page-thumb-window canvas {
+  display: block;
+  width: 100%;
+  background: #fff;
+}
+.page-thumb-caption {
+  display: block;
+  padding: 6px 9px;
+  overflow: hidden;
+  border-top: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .image-sources {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
@@ -1688,6 +1750,137 @@ body.resizing {
 .auth-card .notice,
 .auth-card .form-error {
   margin: 0;
+}
+.auth-microsoft-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+.auth-microsoft-single .auth-mascot-small {
+  display: block;
+  margin-bottom: 10px;
+}
+.auth-microsoft-panel .auth-main {
+  padding: 0;
+}
+.auth-microsoft-panel .auth-body {
+  flex: initial;
+  padding-block: 36px 16px;
+}
+.auth-microsoft-panel .auth-card {
+  padding: 14px;
+}
+.auth-microsoft:not(.auth-microsoft-single) .auth-visual {
+  min-height: max(590px, calc(100dvh - 32px));
+}
+.ms-action {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  text-align: center;
+  text-decoration: none;
+}
+.ms-logo {
+  box-sizing: border-box;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 3px;
+  border-radius: 2px;
+  background: #fff;
+}
+.ms-center, .ms-status p, .ms-callout {
+  margin: 0;
+  color: var(--muted);
+  font-size: .92rem;
+}
+.ms-center {
+  text-align: center;
+}
+.ms-text {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  margin: auto;
+  padding: 4px 0;
+  color: var(--muted);
+  font-size: .85rem;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.ms-text:hover {
+  color: var(--fg);
+}
+.ms-admin summary {
+  list-style: none;
+}
+.ms-admin summary::-webkit-details-marker {
+  display: none;
+}
+.ms-admin .auth-form {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.ms-admin input {
+  min-width: 0;
+}
+.ms-status {
+  display: grid;
+  gap: 10px;
+}
+.ms-status h2 {
+  margin: 0;
+  font-size: 1.15rem;
+  line-height: 1.3;
+}
+.ms-status .ms-action {
+  margin-top: 4px;
+}
+.ms-error {
+  padding-left: 12px;
+  border-left: 3px solid var(--accent);
+}
+.ms-callout {
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: var(--side);
+}
+.ms-warning.banner {
+  display: block;
+  color: var(--fg);
+  border-left: 3px solid var(--warn);
+  background: color-mix(in srgb, var(--mark) 28%, var(--bg));
+}
+@media (min-width: 741px) and (max-width: 960px) {
+  .auth.auth-microsoft:not(.auth-microsoft-single) {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+  }
+}
+@media (max-width: 740px) {
+  .auth.auth-microsoft {
+    padding: 12px;
+  }
+  .auth-microsoft:not(.auth-microsoft-single) .auth-visual {
+    min-height: 0;
+    padding: 20px 14px;
+  }
+  .auth-microsoft .auth-lead {
+    margin-bottom: 18px;
+  }
+  .auth-microsoft .guest-head img {
+    width: 70px;
+    height: 90px;
+  }
+  .auth-microsoft .guest-composer {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 8px;
+  }
+  .auth-microsoft .guest-composer .composer-bar {
+    padding: 0;
+  }
 }
 .auth-tabs {
   display: grid;
@@ -2036,7 +2229,7 @@ td select {
   border: 1px solid var(--line);
   border-radius: 8px;
 }
-.actions button:hover {
+.actions button:not(:disabled):hover {
   background: var(--hover);
 }
 .pill {
@@ -2048,10 +2241,6 @@ td select {
 .pill-pending {
   background: var(--accent-soft);
   color: var(--accent);
-}
-.pill-active {
-  background: var(--ok-soft);
-  color: var(--ok);
 }
 .pill-disabled {
   background: var(--hover);
@@ -2333,6 +2522,39 @@ td select {
   .spin {
     animation: none;
   }
+}
+
+.scan-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+.scan-notice > svg {
+  flex: none;
+  color: var(--warn);
+}
+.scan-notice > span {
+  flex: 1 1 225px;
+}
+.scan-notice .text-btn {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  white-space: nowrap;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 10px;
+}
+.scan-notice-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .file-cards {
@@ -3142,6 +3364,74 @@ td select {
     grid-column: 2;
     opacity: 1;
   }
+}
+
+/* File Saya dan Aplikasi */
+.file-row {
+  cursor: pointer;
+}
+.file-name,
+.file-chat {
+  padding: 0;
+  text-align: left;
+}
+.file-name {
+  max-width: 100%;
+}
+.file-chat {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--faint);
+  text-underline-offset: 2px;
+}
+.file-chat:hover {
+  color: var(--fg);
+}
+.app-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+  margin: 18px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.app-card {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+.app-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: var(--bubble);
+}
+.app-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.app-name {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-weight: 600;
+}
+.app-soon {
+  color: var(--faint);
+  font-size: 0.8rem;
+  font-weight: 400;
+}
+.app-desc {
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.45;
 }
 
 /* Panel teks dokumen */

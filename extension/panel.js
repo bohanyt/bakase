@@ -1,4 +1,4 @@
-// Panel samping: menampilkan Bakase di iframe dan menjembatani baca, sorot, dan gulir.
+// Panel samping: menampilkan Bakase di iframe dan menjembatani aksi di tab aktif.
 // Hanya pesan dari iframe Bakase (origin HUB) yang dilayani, dan balasan hanya dikirim ke
 // origin itu. Halaman dibaca oleh lib/snapshot.js (dibundel dari src/snapshot.js).
 
@@ -8,9 +8,81 @@ const HUB = "http://127.0.0.1:8100";
 // read_attachment, tapi halaman sepanjang ini biasanya sudah tidak relevan.
 const MAX_TEXT = 100000;
 const MAX_ACTION_TEXT = 24000;
+/** Sama dengan batas lampiran Office di server. */
+const MAX_FILE = 25 * 1024 * 1024;
 const REF = /^(?:f([1-9][0-9]{0,9}))?e[1-9][0-9]{0,15}$/;
 const frame = document.getElementById("app");
-frame.src = `${HUB}/?panel=1`;
+const offline = document.getElementById("offline");
+const retry = document.getElementById("retry");
+
+async function panelUrl() {
+  const url = new URL("/?panel=1", HUB);
+  try {
+    const tab = await activeTab();
+    const active = tab?.url && new URL(tab.url);
+    if (active?.origin === HUB && active.pathname === "/" && active.searchParams.get("microsoft") === "pilot") {
+      url.searchParams.set("microsoft", "pilot");
+    }
+  } catch {
+    // Edge bisa gagal mengembalikan tab saat panel baru dibuka.
+  }
+  url.searchParams.set("v", chrome.runtime.getManifest().version);
+  return url.href;
+}
+
+const openingUrl = panelUrl();
+let retryOnOnline = false;
+
+async function healthy() {
+  try {
+    const response = await fetch(HUB + "/api/health", {
+      cache: "no-store",
+      signal: AbortSignal.timeout(6000),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+function showOffline() {
+  frame.hidden = true;
+  offline.hidden = false;
+  retry.disabled = false;
+  const retryPending = retryOnOnline;
+  retryOnOnline = false;
+  if (retryPending) return connect();
+}
+
+async function verifyFirstLoad() {
+  // Edge juga memicu load untuk halaman gagal.
+  retry.disabled = true;
+  if (!await healthy()) {
+    frame.removeAttribute("src");
+    return showOffline();
+  }
+  retry.disabled = false;
+  retryOnOnline = false;
+}
+
+async function connect() {
+  if (frame.hasAttribute("src") || retry.disabled) return;
+  retry.disabled = true;
+  if (!await healthy()) return showOffline();
+  const url = await openingUrl;
+  frame.addEventListener("load", verifyFirstLoad, { once: true });
+  frame.src = url;
+  frame.hidden = false;
+  offline.hidden = true;
+  retry.disabled = false;
+}
+
+retry.addEventListener("click", connect);
+window.addEventListener("online", () => {
+  if (retry.disabled) retryOnOnline = true;
+  else return connect();
+});
+document.addEventListener("DOMContentLoaded", connect, { once: true });
 
 async function activeTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -139,7 +211,8 @@ function forgetPage(page = latest) {
   unwatchSource(page);
   frame.contentWindow.postMessage({ type: "app:halaman-berubah", pageId: page.id }, HUB);
 }
-const sendProgress = (id, text) => frame.contentWindow.postMessage({ type: "app:progres", id, text }, HUB);
+const sendProgress = (id, text, details) =>
+  frame.contentWindow.postMessage({ type: "app:progres", id, text, ...details }, HUB);
 
 async function readFrame(tabId, { frameId, documentId, url }, base, pageId = null) {
   const [r] = await chrome.scripting.executeScript({
@@ -176,6 +249,130 @@ async function snapshot(tab, watch) {
   return settled.flatMap((s) => (s.status === "fulfilled" && s.value.result ? [s.value] : []));
 }
 
+/** Fokus user dari semua frame jadi satu catatan pendek. Sheet dan sel didahulukan. */
+const MAX_FOCUS = 500;
+function mergeFocus(lists) {
+  const items = [...new Set(lists.flatMap((list) => (Array.isArray(list) ? list : []))
+    .filter((item) => typeof item === "string" && item.trim()))];
+  items.sort((a, b) => Number(/^(sheet|sel) /.test(b)) - Number(/^(sheet|sel) /.test(a)));
+  let text = "";
+  for (const item of items.slice(0, 6)) {
+    const next = text ? `${text}; ${item}` : item;
+    if (next.length > MAX_FOCUS) break;
+    text = next;
+  }
+  return text;
+}
+
+/** Fokus user di tab tanpa membaca seluruh halaman (dipakai saat file Excel Online diunduh).
+ * Frame yang tidak bisa disuntik (misalnya penampil PDF) membuat pemanggilan semua frame gagal,
+ * jadi kalau begitu cukup frame utama. */
+async function readFocusOf(tab) {
+  const run = async (target) => {
+    await chrome.scripting.executeScript({ target, files: ["lib/snapshot.js"] });
+    return chrome.scripting.executeScript({ target, func: () => globalThis.AppSnapshot?.readFocus?.() ?? [] });
+  };
+  const results = await run({ tabId: tab.id, allFrames: true })
+    .catch(() => run({ tabId: tab.id, frameIds: [0] }))
+    .catch(() => []);
+  return mergeFocus(results.map((r) => r.result));
+}
+
+// excel-online:mulai
+/** shared storage dan shared storage milik tenant kantor saja (`appid` dan `appid-my`). */
+const OFFICE_STORAGE = /^appid(-my)?\.example\.com$/i;
+/** Alamat unduh file Excel yang sedang dibuka di Excel Online (shared storage atau shared storage kantor).
+ * Excel Online menggambar ulang selnya terus-menerus dan hanya merender yang tampil, jadi isi
+ * lengkapnya diambil dari file aslinya, bukan dari layar. */
+function excelDownloads(address) {
+  let url;
+  try {
+    url = new URL(address);
+  } catch {
+    return [];
+  }
+  if (url.protocol !== "https:" || !OFFICE_STORAGE.test(url.hostname)) return [];
+  const found = [];
+  // Tautan berbagi: /:x:/g/... atau /:x:/r/...
+  if (/^\/:x:\//i.test(url.pathname)) {
+    const link = new URL(url.href);
+    link.hash = "";
+    link.searchParams.set("download", "1");
+    found.push(link.href);
+  }
+  // File yang dibuka dari pustaka dokumen: .../_layouts/15/Doc.aspx?sourcedoc={GUID}
+  const id = (url.searchParams.get("sourcedoc") || "").replace(/[{}]/g, "");
+  const at = url.pathname.toLowerCase().indexOf("/_layouts/");
+  if (at >= 0 && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    found.push(`${url.origin}${url.pathname.slice(0, at)}/_layouts/15/download.aspx?UniqueId=${id}`);
+  }
+  return found;
+}
+// excel-online:akhir
+
+/** Mengunduh file Excel dari tab itu sendiri, jadi memakai login user di browser (tanpa Microsoft
+ * Graph). Hasilnya harus ZIP (xlsx/xlsm); halaman login atau error dilewati. */
+async function fetchExcel(tab, addresses) {
+  const [r] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id, frameIds: [0] },
+    func: async (candidates, max) => {
+      for (const address of candidates) {
+        try {
+          const response = await fetch(address, { credentials: "include" });
+          if (!response.ok) continue;
+          if (Number(response.headers.get("content-length") || 0) > max) return { error: "too_big" };
+          // Ukuran bisa tidak dikirim server, jadi batasnya ditegakkan sambil membaca.
+          const reader = response.body.getReader();
+          const parts = [];
+          let size = 0;
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            size += value.length;
+            if (size > max) {
+              await reader.cancel();
+              return { error: "too_big" };
+            }
+            parts.push(value);
+          }
+          const bytes = new Uint8Array(size);
+          let at = 0;
+          for (const part of parts) {
+            bytes.set(part, at);
+            at += part.length;
+          }
+          if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) continue;
+          const disposition = response.headers.get("content-disposition") || "";
+          const star = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+          const plain = /filename="?([^";]+)"?/i.exec(disposition);
+          let name = "";
+          try {
+            name = star ? decodeURIComponent(star[1]) : plain ? plain[1] : "";
+          } catch {
+            name = "";
+          }
+          let binary = "";
+          for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+          return { name, data: btoa(binary) };
+        } catch {
+          // Coba alamat berikutnya.
+        }
+      }
+      return null;
+    },
+    args: [addresses, MAX_FILE],
+  });
+  return r?.result ?? null;
+}
+
+function excelName(name, title) {
+  const clean = (value) => String(value || "").replace(/[\u0000-\u001f\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim();
+  let base = clean(name) || clean(title).replace(/\s*[-–|]\s*(Microsoft\s+)?Excel.*$/i, "") || "File Excel";
+  base = base.replace(/\.xls$/i, ".xlsx");
+  if (!/\.(xlsx|xlsm)$/i.test(base)) base += ".xlsx";
+  return base.slice(-120);
+}
+
 async function readPage(msg) {
   const reply = (data) => frame.contentWindow.postMessage({ type: "app:halaman", id: msg.id, ...data }, HUB);
   // Satu pembacaan sekaligus (misalnya permintaan lama dari percakapan yang sudah ditinggal
@@ -192,6 +389,26 @@ async function readPage(msg) {
     if (!tab?.id || !/^https?:/.test(tab.url || "")) {
       reply({ error: "Halaman ini tidak bisa dibaca. Buka halaman web (http/https) di tab aktif." });
       return;
+    }
+    const downloads = excelDownloads(tab.url);
+    if (downloads.length) {
+      sendProgress(msg.id, "Mengambil file Excel…");
+      const focus = await readFocusOf(tab).catch(() => "");
+      const file = await fetchExcel(tab, downloads).catch(() => null);
+      if (file?.error === "too_big") {
+        reply({ error: "File Excel ini lebih dari 25 MB. Unduh lalu lampirkan bagian yang dibutuhkan saja." });
+        return;
+      }
+      if (file?.data) {
+        const binary = atob(file.data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        const page = { title: tab.title || "", url: displayUrl(tab.url), text: "", image: null, focus,
+          file: { name: excelName(file.name, tab.title), bytes: bytes.buffer } };
+        frame.contentWindow.postMessage({ type: "app:halaman", id: msg.id, page }, HUB, [bytes.buffer]);
+        return;
+      }
+      // Tidak bisa diunduh (misalnya unduhan diblokir): baca layarnya seperti halaman biasa.
     }
     const readingWatch = watchTab(tab, () => {
       if (latest?.watch === readingWatch) forgetPage();
@@ -217,7 +434,8 @@ async function readPage(msg) {
     }
     const main = top.result;
     const { text, refs } = mergeFrames(main, extra);
-    const pageData = { title: main.title, url: displayUrl(main.url), text, stats: main.stats };
+    const focus = mergeFocus(results.map((r) => r.result?.focus));
+    const pageData = { title: main.title, url: displayUrl(main.url), text, stats: main.stats, focus };
     const same = !watch.moved() && await stillShowing(tab, top.documentId, main.url).catch(() => false);
     if (!same || watch.moved()) {
       reply({ page: { ...pageData, image: null } });
@@ -227,7 +445,7 @@ async function readPage(msg) {
     const snapshotId = crypto.randomUUID();
     latest = { id: snapshotId, tab, watch, documents, refs, source: null };
     watch = null;
-    reply({ page: { ...pageData, image, snapshotId } });
+    reply({ page: { ...pageData, image, snapshotId, ambilTabel: true } });
   } catch {
     reply({ error: "Halaman tidak bisa dibaca. Buka halaman web di tab aktif dan coba lagi." });
   } finally {
@@ -259,10 +477,11 @@ async function actOnPage(msg) {
   }
   const { ref, action, direction, remaining_ms } = msg;
   const match = typeof ref === "string" && REF.exec(ref);
-  if ((ref !== null && !match) || (action === "sorot" && !match) ||
-      (action === "gulir" && !["up", "down", "to"].includes(direction)) ||
-      (direction === "to" && !match) || !["sorot", "gulir"].includes(action) ||
-      !Number.isFinite(remaining_ms) || remaining_ms < 0 || remaining_ms > 8000) {
+  const table = action === "ambil_tabel";
+  const valid = action === "gulir"
+    ? ((match || ref === null) && ["up", "down", "to"].includes(direction) && (direction !== "to" || match))
+    : ((action === "sorot" || table) && match && direction === undefined);
+  if (!valid || !Number.isFinite(remaining_ms) || remaining_ms < 0 || remaining_ms > (table ? 62000 : 8000)) {
     reply({ status: "failed" });
     forgetPage(page);
     return;
@@ -278,7 +497,8 @@ async function actOnPage(msg) {
     return;
   }
   const localDeadline = receivedAt + remaining_ms;
-  const request = { id: msg.id, pageId: page.id, dest, localDeadline, cancelled: false, phase: "app:izin-aksi" };
+  const request = { id: msg.id, pageId: page.id, dest, localDeadline, cancelled: false, table,
+    phase: "app:izin-aksi", lastProgress: -Infinity };
   current = request;
   const active = async () => {
     if (request.cancelled || latest !== page || performance.now() >= localDeadline) return false;
@@ -307,6 +527,19 @@ async function actOnPage(msg) {
       return;
     }
     const result = r?.result;
+    if (result?.status === "table" && table) {
+      const [source] = await chrome.scripting.executeScript({
+        target: { tabId: page.tab.id, documentIds: [dest.documentId] },
+        func: () => location.href,
+      });
+      if (source?.result !== dest.url || !await active()) {
+        reply({ status: "unavailable" });
+        return;
+      }
+      keep = true;
+      reply({ status: "table", table: result.table });
+      return;
+    }
     if (result?.status !== "scrolled") {
       keep = result?.status === "highlighted" || result?.status === "stale_ref";
       reply({ status: result?.status || "failed" });
@@ -365,15 +598,26 @@ async function verifyPage(msg) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const page = latest;
   if (!page || msg?.pageId !== page.id || sender.tab?.id !== page.tab.id) return;
-  if (msg.type === "app:frame-berubah" && sender.documentId === page.source?.documentId) {
+  if (msg.type === "app:frame-berubah" && (sender.documentId === page.source?.documentId ||
+      (current?.table && sender.documentId === current.dest.documentId))) {
     forgetPage(page);
     return;
   }
-  if (!current?.phase || msg.type !== current.phase || msg.id !== current.id) return;
-  const allowed = sender.documentId === current.dest.documentId && !current.cancelled
+  if (!current || msg.id !== current.id) return;
+  const allowed = sender.documentId === current.dest.documentId && !current.cancelled && !page.watch.moved()
     && performance.now() < current.localDeadline;
-  if (allowed) current.phase = msg.type === "app:izin-aksi" ? "app:cek-aksi" : null;
-  sendResponse(allowed);
+  if (current.table && current.phase === null && msg.type === "app:lanjut-tabel") {
+    const { rows } = msg;
+    if (allowed && Number.isInteger(rows) && rows > 0 && rows <= 5000 &&
+        performance.now() - current.lastProgress >= 400) {
+      current.lastProgress = performance.now();
+      sendProgress(current.id, `Mengambil tabel: ${rows} baris…`, { rows });
+    }
+    sendResponse(allowed);
+  } else if (current.phase && msg.type === current.phase) {
+    if (allowed) current.phase = msg.type === "app:izin-aksi" ? "app:cek-aksi" : null;
+    sendResponse(allowed);
+  }
 });
 
 window.addEventListener("message", (event) => {

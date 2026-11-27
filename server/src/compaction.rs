@@ -237,29 +237,41 @@ async fn summarize_stage(
     recap: Option<&ChatMessage>,
     max_output: usize,
     usage: &mut Usage,
+    trace: &mut crate::turn_trace::Turn,
 ) -> anyhow::Result<String> {
+    use crate::turn_trace::Status;
     let input: Vec<_> = recap
         .into_iter()
         .chain(history)
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
     usage.start_request();
-    let response = state
-        .llm
-        .respond(
-            json!(input),
-            json!({
-                "instructions": INSTRUCTIONS,
-                "max_output_tokens": max_output,
-            }),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("{}", crate::llm::error_summary(&error)))?;
+    let request = state.llm.request(
+        json!(input),
+        json!({
+            "instructions": INSTRUCTIONS,
+            "max_output_tokens": max_output,
+        }),
+        false,
+    );
+    trace.begin_model("compaction", &request);
+    let response = state.llm.respond_request(request).await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            trace.end(Status::Failed);
+            return Err(anyhow::anyhow!("{}", crate::llm::error_summary(&error)));
+        }
+    };
+    trace.model_metadata(&response);
     usage.add_response(&response);
     let text = agent::output_text(&response);
+    trace.delta("model_text", None, &text);
     if response["status"] != "completed" || text.trim().is_empty() {
+        trace.end(Status::Failed);
         anyhow::bail!("respons kosong atau belum selesai");
     }
+    trace.end(Status::Ok);
     Ok(text.trim().to_owned())
 }
 
@@ -270,13 +282,14 @@ fn progress(running: bool, summary: Option<&Summary>, tx: &Sender<Event>) -> boo
     tx.try_send(event).is_ok()
 }
 
-struct Checkpoint {
+struct Checkpoint<'a> {
     summary: Option<Summary>,
     usage: Usage,
     started: bool,
+    trace: &'a mut crate::turn_trace::Turn,
 }
 
-impl Checkpoint {
+impl Checkpoint<'_> {
     async fn recheck(&mut self, state: &AppState, user_id: i64) -> anyhow::Result<()> {
         if let Some(summary) = &self.summary
             && !conversations::can_reuse_summary(state, user_id, &summary.references.documents)
@@ -295,7 +308,7 @@ async fn compact_locked(
     tx: &Sender<Event>,
     deadline: Instant,
     retry_after: Option<Instant>,
-    checkpoint: &mut Checkpoint,
+    checkpoint: &mut Checkpoint<'_>,
 ) -> anyhow::Result<()> {
     let id = turn.id.clone();
     let stored = state
@@ -400,6 +413,7 @@ async fn compact_locked(
             recap.as_ref(),
             max_output,
             &mut checkpoint.usage,
+            checkpoint.trace,
         )
         .await?;
         let updated = Summary {
@@ -438,6 +452,7 @@ pub(crate) async fn prepare(
     turn: &Turn,
     user_id: i64,
     tx: &Sender<Event>,
+    trace: &mut crate::turn_trace::Turn,
 ) -> (Vec<ChatMessage>, Usage) {
     let initial = visible_summary(turn);
     let budget = state.context_tokens.saturating_mul(4);
@@ -466,6 +481,7 @@ pub(crate) async fn prepare(
     let guard = tokio::select! {
         result = tokio::time::timeout_at(deadline, attempt.lock()) => result.ok(),
         _ = tx.closed() => None,
+        _ = crate::stop_requested(state.chat_shutdown.clone()) => None,
     };
     let Some(mut retry_after) = guard else {
         return (
@@ -477,15 +493,18 @@ pub(crate) async fn prepare(
         summary: initial.cloned(),
         usage: Usage::default(),
         started: false,
+        trace,
     };
     let result = tokio::select! {
         result = tokio::time::timeout_at(deadline, compact_locked(
             state, turn, user_id, tx, deadline, *retry_after, &mut checkpoint,
         )) => Some(result),
         _ = tx.closed() => None,
+        _ = crate::stop_requested(state.chat_shutdown.clone()) => None,
     };
     match result {
         Some(Err(_)) => {
+            checkpoint.trace.end(crate::turn_trace::Status::Stopped);
             *retry_after = Some(Instant::now() + RETRY_DELAY);
             tracing::warn!("ringkasan obrolan gagal: waktu habis");
         }
@@ -493,7 +512,8 @@ pub(crate) async fn prepare(
             *retry_after = Some(Instant::now() + RETRY_DELAY);
             tracing::warn!("ringkasan obrolan gagal: {error}");
         }
-        _ => (),
+        None => checkpoint.trace.end(crate::turn_trace::Status::Stopped),
+        Some(Ok(Ok(()))) => (),
     }
     if checkpoint.started
         || checkpoint.summary.as_ref().map(|s| s.through_message_id)

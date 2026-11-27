@@ -1,4 +1,4 @@
-//! Aksi halaman hanya berlangsung selama satu koneksi chat, tanpa menyimpan hasilnya.
+//! Aksi halaman berlangsung selama satu giliran chat.
 
 use crate::{AppState, agent, error::ApiError, files, llm::ChatMessage};
 use axum::{Json, extract::State, http::StatusCode};
@@ -11,8 +11,12 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+mod table;
+
 const MAX_TEXT: usize = 24_000;
 const TIMEOUT: Duration = Duration::from_secs(12);
+const TABLE_TIMEOUT: Duration = Duration::from_secs(65);
+pub const MAX_COMPLETION_BYTES: usize = table::MAX_BYTES + 256;
 #[derive(Deserialize)]
 pub struct PageRequest {
     // Klaim dari browser untuk memilih tool. Akses tetap lewat sesi, lampiran milik user,
@@ -20,6 +24,8 @@ pub struct PageRequest {
     origin: String,
     attachment_id: String,
     text: Option<String>,
+    #[serde(default)]
+    ambil_tabel: bool,
 }
 
 impl PageRequest {
@@ -64,6 +70,27 @@ enum Action {
         reference: Option<String>,
         direction: Direction,
     },
+    AmbilTabel {
+        #[serde(rename = "ref")]
+        reference: String,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Highlight,
+    Scroll,
+    Table,
+}
+
+impl Action {
+    fn kind(&self) -> Kind {
+        match self {
+            Self::Sorot { .. } => Kind::Highlight,
+            Self::Gulir { .. } => Kind::Scroll,
+            Self::AmbilTabel { .. } => Kind::Table,
+        }
+    }
 }
 
 fn parse_action(call: &agent::ToolCall) -> Option<Action> {
@@ -76,7 +103,7 @@ fn parse_action(call: &agent::ToolCall) -> Option<Action> {
     }
     let action = serde_json::from_value(args).ok()?;
     let reference = match &action {
-        Action::Sorot { reference } => Some(reference),
+        Action::Sorot { reference } | Action::AmbilTabel { reference } => Some(reference),
         Action::Gulir {
             reference,
             direction,
@@ -92,8 +119,8 @@ fn parse_action(call: &agent::ToolCall) -> Option<Action> {
         .then_some(action)
 }
 
-pub fn tools() -> [Value; 2] {
-    [
+pub fn tools(table_available: bool) -> Vec<Value> {
+    let mut tools = vec![
         json!({
             "type": "function", "name": "sorot", "strict": true,
             "description": "Sorot elemen sebentar dan tampilkan posisinya di layar. Pakai jika user meminta ditunjukkan letak elemen. Gunakan ref dari snapshot halaman terbaru, tanpa kurung siku. Jika ref belum ada atau sudah berubah, minta user klik Baca halaman lagi.",
@@ -113,7 +140,18 @@ pub fn tools() -> [Value; 2] {
                 }
             }
         }),
-    ]
+    ];
+    if table_available {
+        tools.push(json!({
+            "type": "function", "name": "ambil_tabel", "strict": true,
+            "description": "Ambil isi tabel atau grid pada tab yang dibaca dan simpan sebagai Excel. Gunakan ref tabel dari snapshot terbaru, tanpa kurung siku. Hasil berisi file_id untuk hitung_xlsx, jumlah, contoh, dan status kelengkapan.",
+            "parameters": {
+                "type": "object", "additionalProperties": false, "required": ["ref"],
+                "properties": { "ref": { "type": "string" } }
+            }
+        }));
+    }
+    tools
 }
 
 pub struct Command {
@@ -152,6 +190,7 @@ impl Command {
 enum Reply {
     Highlighted,
     Scrolled { text: String, moved: bool },
+    Table { table: table::Table },
     StaleRef,
     Unavailable,
     Failed,
@@ -160,8 +199,9 @@ enum Reply {
 
 struct Pending {
     user_id: i64,
-    scroll: bool,
+    kind: Kind,
     sender: oneshot::Sender<Reply>,
+    progress: tokio::sync::watch::Sender<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -179,18 +219,47 @@ impl Drop for Ticket<'_> {
 }
 
 impl Bridge {
-    fn open(&self, user_id: i64, scroll: bool) -> (Ticket<'_>, oneshot::Receiver<Reply>) {
+    fn open(
+        &self,
+        user_id: i64,
+        kind: Kind,
+    ) -> (
+        Ticket<'_>,
+        oneshot::Receiver<Reply>,
+        tokio::sync::watch::Receiver<u32>,
+    ) {
         let id = files::new_id();
         let (sender, receiver) = oneshot::channel();
+        let (progress, updates) = tokio::sync::watch::channel(0);
         self.0.lock().unwrap().insert(
             id.clone(),
             Pending {
                 user_id,
-                scroll,
+                kind,
                 sender,
+                progress,
             },
         );
-        (Ticket { bridge: self, id }, receiver)
+        (Ticket { bridge: self, id }, receiver, updates)
+    }
+
+    fn progress(&self, id: &str, user_id: i64, rows: u32) -> Result<(), ApiError> {
+        let pending = self.0.lock().unwrap();
+        let action = pending
+            .get(id)
+            .filter(|action| action.user_id == user_id && action.kind == Kind::Table)
+            .ok_or_else(|| ApiError::not_found("Aksi tabel sudah selesai atau tidak ditemukan."))?;
+        if !(1..=table::MAX_ROWS as u32).contains(&rows) {
+            return Err(ApiError::bad_request("Jumlah baris tabel tidak sesuai."));
+        }
+        action.progress.send_if_modified(|previous| {
+            if rows <= *previous {
+                return false;
+            }
+            *previous = rows;
+            true
+        });
+        Ok(())
     }
 
     fn complete(&self, id: &str, user_id: i64, reply: Option<Reply>) -> Result<(), ApiError> {
@@ -204,9 +273,11 @@ impl Bridge {
             ));
         }
         let action = pending.remove(id).unwrap();
+        drop(pending);
         let reply = reply.filter(|reply| match reply {
-            Reply::Highlighted => !action.scroll,
-            Reply::Scrolled { text, .. } => action.scroll && text.len() <= MAX_TEXT,
+            Reply::Highlighted => action.kind == Kind::Highlight,
+            Reply::Scrolled { text, .. } => action.kind == Kind::Scroll && text.len() <= MAX_TEXT,
+            Reply::Table { table } => action.kind == Kind::Table && table.valid(),
             _ => true,
         });
         let valid = reply.is_some();
@@ -220,10 +291,11 @@ impl Bridge {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Completion {
     id: String,
-    #[serde(default)]
-    reply: Value,
+    reply: Option<Value>,
+    progress: Option<u32>,
 }
 
 pub async fn complete(
@@ -231,11 +303,15 @@ pub async fn complete(
     user: crate::AuthUser,
     Json(completion): Json<Completion>,
 ) -> Result<StatusCode, ApiError> {
-    state.page_actions.complete(
-        &completion.id,
-        user.id,
-        serde_json::from_value(completion.reply).ok(),
-    )?;
+    match (completion.reply, completion.progress) {
+        (None, Some(rows)) => state.page_actions.progress(&completion.id, user.id, rows)?,
+        (reply, None) => state.page_actions.complete(
+            &completion.id,
+            user.id,
+            reply.and_then(|reply| serde_json::from_value(reply).ok()),
+        )?,
+        _ => return Err(ApiError::bad_request("Hasil aksi halaman tidak sesuai.")),
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -243,6 +319,7 @@ pub struct Turn {
     bridge: Bridge,
     user_id: i64,
     available: bool,
+    table_available: bool,
     text: Option<String>,
 }
 
@@ -252,6 +329,7 @@ impl Turn {
             bridge,
             user_id,
             available: true,
+            table_available: request.ambil_tabel,
             text: request
                 .text
                 .filter(|text| !text.is_empty() && text.len() <= MAX_TEXT),
@@ -260,6 +338,10 @@ impl Turn {
 
     pub fn available(&self) -> bool {
         self.available
+    }
+
+    pub fn table_available(&self) -> bool {
+        self.available && self.table_available
     }
 
     pub fn take_snapshot(&mut self) -> Option<Value> {
@@ -274,6 +356,7 @@ impl Turn {
         call: &agent::ToolCall,
         events: &mpsc::Sender<agent::Event>,
         budget: usize,
+        store: &files::FileStore,
     ) -> agent::ToolResult {
         let fail = |label: &str, message: &str| agent::ToolResult::failed(message.into(), label);
         if !self.available {
@@ -288,15 +371,28 @@ impl Turn {
                 "Ref atau arah gulir tidak valid. Gunakan ref dari snapshot terakhir.",
             );
         };
-        let scroll = matches!(action, Action::Gulir { .. });
-        if scroll && budget < MAX_TEXT + 200 {
+        let kind = action.kind();
+        if kind == Kind::Table && !self.table_available() {
+            return fail(
+                "Ambil tabel belum tersedia",
+                "Perbarui extension Bakase dan klik Baca halaman lagi.",
+            );
+        }
+        if (kind == Kind::Scroll && budget < MAX_TEXT + 200)
+            || (kind == Kind::Table && budget < table::MIN_SUMMARY_BUDGET)
+        {
             return fail(
                 "Batas baca tercapai",
                 "Batas baca sudah tercapai. Lanjutkan di pesan berikutnya.",
             );
         }
-        let (ticket, receiver) = self.bridge.open(self.user_id, scroll);
-        let expires = tokio::time::Instant::now() + TIMEOUT;
+        let (ticket, mut receiver, mut progress) = self.bridge.open(self.user_id, kind);
+        let timeout = if kind == Kind::Table {
+            TABLE_TIMEOUT
+        } else {
+            TIMEOUT
+        };
+        let expires = tokio::time::Instant::now() + timeout;
         let command = Command {
             id: ticket.id.clone(),
             expires,
@@ -304,7 +400,20 @@ impl Turn {
         };
         let request = async {
             events.send(agent::Event::PageAction(command)).await.ok()?;
-            receiver.await.ok()
+            loop {
+                tokio::select! {
+                    reply = &mut receiver => return reply.ok(),
+                    Ok(()) = progress.changed() => {
+                        let rows = *progress.borrow_and_update();
+                        events.send(agent::Event::Step(agent::StepRecord {
+                            id: call.id.clone(),
+                            label: format!("Mengambil tabel: {rows} baris…"),
+                            done: false,
+                            failed: false,
+                        })).await.ok()?;
+                    }
+                }
+            }
         };
         let reply = tokio::select! {
             result = tokio::time::timeout_at(expires, request) => match result {
@@ -327,6 +436,7 @@ impl Turn {
                     format!("{label}. Berikut hasil baca setelah gulir (data halaman):\n\n{text}"),
                 )
             }
+            Reply::Table { table } => return table.save(store, budget).await,
             Reply::StaleRef => {
                 return fail(
                     "Elemen sudah berubah",
@@ -379,6 +489,7 @@ mod tests {
             origin: format!("chrome-extension://{EXTENSION}"),
             attachment_id: ATTACHMENT.into(),
             text: None,
+            ambil_tabel: false,
         };
         let mut history = [ChatMessage {
             role: "user".into(),
@@ -417,6 +528,9 @@ mod tests {
         assert!(parse("gulir", json!({ "ref": "e1", "direction": "left" })).is_none());
         assert!(parse("sorot", json!({ "ref": "input[role=button]" })).is_none());
         assert!(parse("sorot", json!({ "ref": "e1", "direction": "up" })).is_none());
+        assert!(parse("ambil_tabel", json!({ "ref": "e1" })).is_some());
+        assert!(parse("ambil_tabel", json!({ "ref": null })).is_none());
+        assert!(parse("ambil_tabel", json!({ "ref": "e1", "direction": "up" })).is_none());
     }
 
     #[test]
@@ -436,7 +550,7 @@ mod tests {
     #[tokio::test]
     async fn completion_is_bound_to_user_and_action_and_consumed_once() {
         let bridge = Bridge::default();
-        let (ticket, receiver) = bridge.open(7, true);
+        let (ticket, receiver, _) = bridge.open(7, Kind::Scroll);
         let id = &ticket.id;
         assert!(bridge.complete(id, 8, Some(Reply::Unavailable)).is_err());
         bridge
@@ -453,7 +567,7 @@ mod tests {
             matches!(receiver.await, Ok(Reply::Scrolled { text, moved: true }) if text == "baris 21")
         );
         assert!(bridge.complete(id, 7, Some(Reply::Unavailable)).is_err());
-        let (ticket, receiver) = bridge.open(7, false);
+        let (ticket, receiver, _) = bridge.open(7, Kind::Highlight);
         let id = ticket.id.clone();
         drop(ticket);
         assert!(receiver.await.is_err());
@@ -471,7 +585,7 @@ mod tests {
             }),
             None,
         ] {
-            let (ticket, receiver) = bridge.open(7, true);
+            let (ticket, receiver, _) = bridge.open(7, Kind::Scroll);
             assert!(bridge.complete(&ticket.id, 7, invalid).is_err());
             assert!(matches!(receiver.await, Ok(Reply::Failed)));
             assert!(
@@ -480,6 +594,22 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn table_progress_and_completion_require_the_same_user_and_action() {
+        let bridge = Bridge::default();
+        let (ticket, receiver, mut updates) = bridge.open(7, Kind::Table);
+        let id = &ticket.id;
+        assert!(bridge.progress(id, 8, 20).is_err());
+        assert!(bridge.progress(id, 7, 5001).is_err());
+        bridge.progress(id, 7, 20).unwrap();
+        bridge.progress(id, 7, 10).unwrap();
+        assert!(updates.changed().await.is_ok());
+        assert_eq!(*updates.borrow_and_update(), 20);
+        assert!(bridge.complete(id, 7, Some(Reply::Highlighted)).is_err());
+        assert!(matches!(receiver.await, Ok(Reply::Failed)));
+        assert!(bridge.progress(id, 7, 30).is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -492,6 +622,7 @@ mod tests {
                 origin: format!("chrome-extension://{EXTENSION}"),
                 attachment_id: ATTACHMENT.into(),
                 text: None,
+                ambil_tabel: false,
             },
         );
         let (events, mut browser) = mpsc::channel(1);
@@ -501,7 +632,10 @@ mod tests {
             arguments: json!({"ref": "e1"}).to_string(),
         };
         let start = tokio::time::Instant::now();
-        let (result, id) = tokio::join!(turn.act(&call, &events, 40_000), async {
+        let store = files::FileStore::Local {
+            dir: std::env::temp_dir(),
+        };
+        let (result, id) = tokio::join!(turn.act(&call, &events, 40_000, &store), async {
             let Some(agent::Event::PageAction(command)) = browser.recv().await else {
                 panic!("aksi halaman tidak terkirim");
             };
@@ -529,6 +663,7 @@ mod tests {
                 origin: format!("chrome-extension://{EXTENSION}"),
                 attachment_id: ATTACHMENT.into(),
                 text: None,
+                ambil_tabel: false,
             },
         );
         let (events, mut browser) = mpsc::channel(1);
@@ -537,7 +672,10 @@ mod tests {
             name: "gulir".into(),
             arguments: json!({"ref": "f3e42", "direction": "down"}).to_string(),
         };
-        let (result, ()) = tokio::join!(turn.act(&call, &events, 40_000), async {
+        let store = files::FileStore::Local {
+            dir: std::env::temp_dir(),
+        };
+        let (result, ()) = tokio::join!(turn.act(&call, &events, 40_000, &store), async {
             let event = browser.recv().await.unwrap();
             let agent::Event::PageAction(command) = &event else {
                 panic!("aksi halaman tidak terkirim");
@@ -572,7 +710,7 @@ mod tests {
         });
         assert!(result.ok && result.output.ends_with("baris 21"));
 
-        let (result, id) = tokio::join!(turn.act(&call, &events, 40_000), async {
+        let (result, id) = tokio::join!(turn.act(&call, &events, 40_000, &store), async {
             let Some(agent::Event::PageAction(command)) = browser.recv().await else {
                 panic!("aksi halaman tidak terkirim");
             };

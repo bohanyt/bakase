@@ -27,9 +27,11 @@ test("balasan extension diperiksa bentuknya", () => {
   // Hanya JPEG dari captureVisibleTab yang diterima sebagai screenshot.
   assert.deepEqual(ok, { page: { title: "Daftar permintaan", url: "https://demo.example.test/daftar", text: "isi", image: null } });
   const snapshotId = "a".repeat(8) + "-bbbb-cccc-dddd-" + "e".repeat(12);
-  const fromPanel = (id: string) => readReply({ type: "app:halaman", id: "1", page: { text: "isi", snapshotId: id } }, "1");
+  const fromPanel = (id: string, ambilTabel?: unknown) =>
+    readReply({ type: "app:halaman", id: "1", page: { text: "isi", snapshotId: id, ambilTabel } }, "1");
   assert.deepEqual(fromPanel(snapshotId), { page: { title: "", url: "", text: "isi", image: null, snapshotId } });
-  assert.deepEqual(fromPanel("lain"), { page: { title: "", url: "", text: "isi", image: null } });
+  assert.deepEqual(fromPanel(snapshotId, true), { page: { title: "", url: "", text: "isi", image: null, snapshotId, ambilTabel: true } });
+  assert.deepEqual(fromPanel("lain", true), { page: { title: "", url: "", text: "isi", image: null } });
 });
 
 test("kabar progres hanya untuk permintaan yang sama", () => {
@@ -75,4 +77,42 @@ test("lampiran dari panel lama hanya menulis origin dan path HTTP(S)", async () 
     const [file] = pageFiles(reply.page, now);
     assert.equal((await file.text()).split("\n")[2], `Alamat: ${expected}`);
   }
+});
+
+test("file Excel asli dari Excel Online jadi satu lampiran, bukan teks layar", async () => {
+  const bytes = new Uint8Array([0x50, 0x4b, 3, 4, 9]).buffer;
+  const reply = readReply({ type: "app:halaman", id: "a", page: { title: "Delivery.xlsx", url: "https://contoh.example.com/x", text: "", image: null,
+    file: { name: "Delivery.xlsx", bytes } } }, "a");
+  assert.ok(reply && "page" in reply && reply.page.file);
+  const files = pageFiles(reply.page, new Date(2026, 10, 26, 9, 5));
+  assert.deepEqual(files.map((f) => f.name), ["Delivery.xlsx"]);
+  assert.equal(files[0].size, 5);
+  // Nama bukan Excel, isi kosong, atau terlalu besar tidak diterima sebagai file.
+  for (const file of [{ name: "a.exe", bytes }, { name: "a.xlsx", bytes: new ArrayBuffer(0) },
+    { name: "a.xlsx", bytes: new TextEncoder().encode("<html>").buffer }, { name: "a.xls", bytes },
+    { name: "a.xlsx", bytes: new ArrayBuffer(25 * 1024 * 1024 + 1) }, { name: "a.xlsx", bytes: "bukan" }]) {
+    const r = readReply({ type: "app:halaman", id: "a", page: { title: "x", url: "", text: "", image: null, file } }, "a");
+    assert.ok(r && "page" in r && !r.page.file);
+  }
+});
+
+
+test("fokus user dibersihkan dan ikut di lampiran teks halaman", async () => {
+  const page = { title: "Laporan", url: "https://contoh.test/laporan", text: "- text: \"isi\"", image: null };
+  const reply = readReply(
+    { type: "app:halaman", id: "1", page: { ...page, focus: "tab aktif \"Ringkasan\";\n teks dipilih \"Total\"\u0007" } },
+    "1",
+  );
+  assert.ok(reply && "page" in reply);
+  assert.equal(reply.page.focus, "tab aktif \"Ringkasan\"; teks dipilih \"Total\"");
+  const blank = readReply({ type: "app:halaman", id: "1", page: { ...page, focus: "  " } }, "1");
+  assert.ok(blank && "page" in blank && blank.page.focus === undefined);
+  const long = readReply({ type: "app:halaman", id: "1", page: { ...page, focus: "x".repeat(900) } }, "1");
+  assert.ok(long && "page" in long);
+  assert.equal(long.page.focus?.length, 500);
+
+  const [md] = pageFiles(reply.page, new Date(2026, 10, 26, 17, 0));
+  assert.match(await md.text(), /\nFokus user: tab aktif "Ringkasan"; teks dipilih "Total"\n/);
+  const [plain] = pageFiles({ ...page }, new Date(2026, 10, 26, 17, 0));
+  assert.doesNotMatch(await plain.text(), /Fokus user/);
 });

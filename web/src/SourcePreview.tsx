@@ -70,11 +70,13 @@ export function DocumentText({ text, kind, quoteSource }: { text: string; kind: 
 /** Panel kanan untuk dokumen yang dikutip jawaban. */
 export function SourcePreview({
   source,
+  originalPage,
   width,
   overlay,
   onClose,
 }: {
   source: SourceRef;
+  originalPage?: number;
   width: number | null;
   overlay: boolean;
   onClose: () => void;
@@ -96,8 +98,8 @@ export function SourcePreview({
   }, [source.chunk_id, source.image, attempt]);
 
   const title = sourceName(source);
-  const page = sourcePreviewPage(source.page, data?.page);
-  const pdf = source.kind === "pdf" && (source.image || data || (error && source.doc_id > 0));
+  const page = originalPage ?? sourcePreviewPage(source.page, data?.page);
+  const pdf = source.kind === "pdf" && (originalPage != null || source.image || data || (error && source.doc_id > 0));
   const url = `/api/documents/${source.doc_id}/file`;
   const quoteSource = [title, placeLabel(source.kind, page)].filter(Boolean).join(" · ");
   const text = data?.text ? (
@@ -129,7 +131,7 @@ export function SourcePreview({
         <PdfPreview docId={source.doc_id} title={title} initialPage={page ?? 1} pageCount={data?.document.pages ?? 0}
           excerpt={data?.page != null && data.page === page ? data.text : undefined}
           documentText={data?.page === null ? data.text : undefined} failureFallback={thumbnail} />
-      ) : thumbnail ? thumbnail : isSourceImage(source.kind) ? (
+      ) : thumbnail && originalPage == null ? thumbnail : isSourceImage(source.kind) ? (
         <ImagePreview url={url} title={title} fallback={text} />
       ) : !data && !error ? (
         <div className="loading">Memuat potongan…</div>

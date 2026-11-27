@@ -29,4 +29,6 @@ try {
     Step 'build extension' { npm run build:extension --silent }
 } finally { Pop-Location }
 
+Step 'cek bundel extension' { git -C $root diff --exit-code -- 'extension/lib/snapshot.js' }
+
 Write-Host 'Semua cek lulus.' -ForegroundColor Green

@@ -15,6 +15,7 @@
     "@assistant-ui/react": "^0.15.36",
     "@phosphor-icons/react": "^2.1.10",
     "@streamdown/mermaid": "^1.0.4",
+    "@tanstack/react-table": "8.21.3",
     "chart.js": "^4.6.1",
     "micromark-util-decode-string": "2.0.1",
     "pdfjs-dist": "6.5.438",

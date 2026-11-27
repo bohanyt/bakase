@@ -142,7 +142,7 @@ export function SourceCards({ sources, onOpen, children }: {
                 <span aria-hidden="true"><FileIcon kind={source.kind} size={17} /></span>
                 <span>
                   <strong>{sourceName(source)}</strong>
-                  <small>{place || kindLabel(source.kind)}</small>
+                  <small>{place || kindLabel(source.kind)}{source.scan ? " · scan" : ""}</small>
                 </span>
               </button>
             );

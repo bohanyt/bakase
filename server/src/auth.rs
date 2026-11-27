@@ -27,13 +27,26 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
+use tokio::sync::Semaphore;
 
 pub const SESSION_COOKIE: &str = "app_session";
+/// ID user yang sedang tampil di tab pengirim.
+const TAB_USER_HEADER: &str = "x-app-user";
 const MIN_PASSWORD: usize = 10;
 const MAX_PASSWORD: usize = 200;
 const MAX_FAILURES: u32 = 5;
 const LOCK_SECS: i64 = 15 * 60;
+/// Email yang dicatat pembatas sekaligus.
+const MAX_TRACKED: usize = 10_000;
+/// Batas alamat email di RFC 5321.
+const MAX_EMAIL: usize = 254;
+/// Satu hitungan Argon2 memakai sekitar 19 MiB. Test berjalan paralel dan berbagi jatah ini.
+const ARGON_PARALLEL: usize = if cfg!(test) { 64 } else { 4 };
+const ARGON_WAIT: Duration = Duration::from_secs(5);
+
+static ARGON_SLOTS: Semaphore = Semaphore::const_new(ARGON_PARALLEL);
 
 // ---------- password ----------
 
@@ -59,17 +72,35 @@ fn dummy_hash() -> &'static str {
     HASH.get_or_init(|| hash_password("bukan-password-siapa-pun").unwrap_or_default())
 }
 
-async fn hash_blocking(password: String) -> Result<String, ApiError> {
-    tokio::task::spawn_blocking(move || hash_password(&password))
+/// Menjalankan Argon2 di luar worker async, paling banyak `ARGON_PARALLEL` sekaligus.
+/// Izin ikut ke closure, jadi tetap terpakai sampai hitungan selesai walau klien putus.
+async fn argon<T: Send + 'static>(
+    slots: &'static Semaphore,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ApiError> {
+    let permit = tokio::time::timeout(ARGON_WAIT, slots.acquire())
         .await
-        .map_err(anyhow::Error::from)?
-        .map_err(ApiError::from)
+        .ok()
+        .and_then(Result::ok)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server sibuk. Coba lagi sebentar lagi.",
+            )
+        })?;
+    let done = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        job()
+    });
+    Ok(done.await.map_err(anyhow::Error::from)?)
 }
 
-async fn verify_blocking(password: String, hash: String) -> bool {
-    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
-        .await
-        .unwrap_or(false)
+pub async fn hash_blocking(password: String) -> Result<String, ApiError> {
+    Ok(argon(&ARGON_SLOTS, move || hash_password(&password)).await??)
+}
+
+async fn verify_blocking(password: String, hash: String) -> Result<bool, ApiError> {
+    argon(&ARGON_SLOTS, move || verify_password(&password, &hash)).await
 }
 
 pub fn validate_password(password: &str) -> Result<(), ApiError> {
@@ -94,7 +125,7 @@ pub fn normalize_email(email: &str, domain: &str) -> Result<String, ApiError> {
         && local
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._%+-".contains(c));
-    if !local_ok || !host.eq_ignore_ascii_case(domain) {
+    if !local_ok || email.len() > MAX_EMAIL || !host.eq_ignore_ascii_case(domain) {
         return Err(invalid());
     }
     Ok(email)
@@ -111,7 +142,7 @@ pub fn canonical_department(name: &str, allowed: &[String]) -> Result<String, Ap
 
 // ---------- sesi ----------
 
-fn new_token() -> String {
+pub(crate) fn new_token() -> String {
     let mut bytes = [0u8; 32];
     rand::fill(&mut bytes);
     hex::encode(bytes)
@@ -121,7 +152,7 @@ pub fn token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
-fn session_cookie(token: String, state: &AppState) -> Cookie<'static> {
+pub(crate) fn session_cookie(token: String, state: &AppState) -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE, token))
         .path("/")
         .http_only(true)
@@ -146,21 +177,38 @@ pub(crate) async fn create_session(
     let token = new_token();
     let hash = token_hash(&token);
     let ttl = state.auth.session_hours * 3600;
+    let admins_only = state.auth.microsoft_full();
     let created = state
         .db
         .call(move |c| {
-            let now = now();
-            c.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now])?;
-            let n = c.execute(
-                "INSERT INTO sessions (token_hash, user_id, created_at, expires_at)
-                 SELECT ?1, id, ?3, ?4 FROM users
-                 WHERE id = ?2 AND password_hash = ?5 AND status = 'active'",
-                params![hash, user_id, now, now + ttl, verified_hash],
-            )?;
-            Ok(n == 1)
+            let tx = c.transaction()?;
+            let created =
+                insert_session(&tx, &hash, user_id, ttl, Some(&verified_hash), admins_only)?;
+            tx.commit()?;
+            Ok(created)
         })
         .await?;
     Ok(created.then_some(token))
+}
+
+pub(crate) fn insert_session(
+    tx: &rusqlite::Transaction<'_>,
+    hash: &str,
+    user_id: i64,
+    ttl: i64,
+    password: Option<&str>,
+    admins_only: bool,
+) -> rusqlite::Result<bool> {
+    let now = now();
+    tx.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])?;
+    let n = tx.execute(
+        "INSERT INTO sessions (token_hash, user_id, created_at, expires_at)
+         SELECT ?1, id, ?3, ?4 FROM users
+         WHERE id = ?2 AND status = 'active' AND (?5 IS NULL OR password_hash = ?5)
+           AND (NOT ?6 OR role = 'admin')",
+        params![hash, user_id, now, now + ttl, password, admins_only],
+    )?;
+    Ok(n == 1)
 }
 
 /// Mencari user aktif pemilik token. Masa sesi diperpanjang kalau sudah lewat
@@ -174,8 +222,8 @@ async fn session_user(state: &AppState, token: &str) -> Result<(Option<AuthUser>
             let now = now();
             let row = c
                 .query_row(
-                    "SELECT u.id, u.email, u.name, u.department, u.role, s.expires_at
-                     FROM sessions s JOIN users u ON u.id = s.user_id
+                    "SELECT u.id, u.email, u.name, u.departments, u.role, s.expires_at
+                     FROM sessions s JOIN users_with_access u ON u.id = s.user_id
                      WHERE s.token_hash = ?1 AND s.expires_at > ?2 AND u.status = 'active'",
                     params![hash, now],
                     |r| {
@@ -184,7 +232,7 @@ async fn session_user(state: &AppState, token: &str) -> Result<(Option<AuthUser>
                                 id: r.get(0)?,
                                 email: r.get(1)?,
                                 name: r.get(2)?,
-                                department: r.get(3)?,
+                                departments: crate::access::from_row(r, 3)?,
                                 role: Role::parse(&r.get::<_, String>(4)?).unwrap_or(Role::User),
                             },
                             r.get::<_, i64>(5)?,
@@ -207,6 +255,52 @@ async fn session_user(state: &AppState, token: &str) -> Result<(Option<AuthUser>
     Ok(user)
 }
 
+/// Hash token sesi dari cookie, untuk memeriksa lagi sesinya di tengah giliran.
+pub struct SessionHash(pub String);
+
+impl FromRequestParts<Arc<AppState>> for SessionHash {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        CookieJar::from_headers(&parts.headers)
+            .get(SESSION_COOKIE)
+            .map(|c| Self(token_hash(c.value())))
+            .ok_or_else(ApiError::unauthorized)
+    }
+}
+
+/// Sesi masih berlaku dan hak akses user belum berubah sejak `user` dibaca. Membaca database
+/// bersama, jadi perubahan lewat slot lain ikut terlihat.
+pub async fn access_unchanged(
+    db: &crate::db::Db,
+    user: &AuthUser,
+    session: &str,
+) -> anyhow::Result<bool> {
+    let (id, session) = (user.id, session.to_string());
+    let current = db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT u.departments, u.role
+                 FROM sessions s JOIN users_with_access u ON u.id = s.user_id
+                 WHERE s.token_hash = ?1 AND s.expires_at > ?2 AND u.id = ?3 AND u.status = 'active'",
+                params![session, now(), id],
+                |r| {
+                    Ok((
+                        crate::access::from_row(r, 0)?,
+                        Role::parse(&r.get::<_, String>(1)?).unwrap_or(Role::User),
+                    ))
+                },
+            )
+            .optional()?)
+        })
+        .await?;
+    Ok(current
+        .is_some_and(|(departments, role)| departments == user.departments && role == user.role))
+}
+
 /// Tempat extractor `AuthUser` menitipkan token yang sesinya baru diperpanjang,
 /// supaya middleware `refresh_session_cookie` mengirim ulang cookie-nya.
 #[derive(Clone, Default)]
@@ -226,6 +320,19 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
             .ok_or_else(ApiError::unauthorized)?;
         let (user, extended) = session_user(state, &token).await?;
         let user = user.ok_or_else(ApiError::unauthorized)?;
+        if let Some(seen) = parts.extensions.get::<crate::request_log::SeenUser>() {
+            seen.set(user.id);
+        }
+        // Cookie dipakai bersama semua tab. Tab yang masih menampilkan akun lain tidak boleh
+        // menulis ke akun yang baru masuk.
+        if let Some(expected) = parts.headers.get(TAB_USER_HEADER)
+            && expected.to_str().ok().and_then(|id| id.parse().ok()) != Some(user.id)
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "Akun di tab ini sudah berganti. Muat ulang halaman.",
+            ));
+        }
         if extended
             && let Some(slot) = parts.extensions.get::<CookieRefresh>()
             && let Ok(mut slot) = slot.0.lock()
@@ -273,15 +380,33 @@ impl LoginLimiter {
             return Err(LOCK_SECS);
         };
         let now = now();
-        let entry = map.entry(email.to_string()).or_insert((0, now));
-        if now - entry.1 >= LOCK_SECS {
-            *entry = (0, now);
+        map.retain(|_, (_, since)| now - *since < LOCK_SECS);
+        // Saat penuh, yang belum terkunci dan paling lama dikeluarkan dulu, supaya banjir email
+        // palsu tidak membuka kunci. Menolak email baru akan mengunci semua orang.
+        if map.len() >= MAX_TRACKED
+            && !map.contains_key(email)
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (failures, since))| (*failures >= MAX_FAILURES, *since))
+                .map(|(email, _)| email.clone())
+        {
+            map.remove(&oldest);
         }
+        let entry = map.entry(email.to_string()).or_insert((0, now));
         if entry.0 >= MAX_FAILURES {
             return Err(entry.1 + LOCK_SECS - now);
         }
         entry.0 += 1;
         Ok(())
+    }
+
+    /// Percobaan yang tidak sempat diverifikasi bukan kesalahan user.
+    fn refund(&self, email: &str) {
+        if let Ok(mut map) = self.attempts.lock()
+            && let Some((failures, _)) = map.get_mut(email)
+        {
+            *failures = failures.saturating_sub(1);
+        }
     }
 
     fn success(&self, email: &str) {
@@ -303,6 +428,9 @@ pub struct Options {
     support_whatsapp: Option<String>,
     /// ID extension Edge Bakase yang sah. Web di panel extension hanya menjawab induk ini.
     extension_ids: Vec<String>,
+    extension_version: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    microsoft: Option<&'static str>,
 }
 
 pub async fn options(State(state): State<Arc<AppState>>) -> Json<Options> {
@@ -318,6 +446,13 @@ pub async fn options(State(state): State<Arc<AppState>>) -> Json<Options> {
             .filter(|id| crate::valid_extension_id(id))
             .cloned()
             .collect(),
+        extension_version: crate::extension::version(),
+        microsoft: state
+            .auth
+            .microsoft
+            .as_ref()
+            .filter(|m| m.enabled)
+            .map(|m| if m.pilot.is_empty() { "full" } else { "pilot" }),
     })
 }
 
@@ -334,6 +469,12 @@ pub async fn register(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    if state.auth.microsoft_full() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Gunakan akun Microsoft kantor.",
+        ));
+    }
     let name = req.name.trim().to_string();
     if !(2..=100).contains(&name.chars().count()) {
         return Err(ApiError::bad_request("Isi nama lengkap."));
@@ -353,7 +494,9 @@ pub async fn register(
         .call(move |c| {
             c.execute(
                 "INSERT INTO users (email, name, password_hash, requested_department, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(email) DO NOTHING",
+                 SELECT ?1, ?2, ?3, ?4, ?5
+                 WHERE NOT EXISTS (SELECT 1 FROM microsoft_addresses WHERE email = ?1)
+                 ON CONFLICT(email) DO NOTHING",
                 params![email, name, hash, department, now()],
             )?;
             Ok(())
@@ -378,8 +521,11 @@ pub async fn login(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
     Json(req): Json<LoginRequest>,
-) -> Result<(CookieJar, Json<AuthUser>), ApiError> {
-    let email = req.email.trim().to_lowercase();
+) -> Result<(CookieJar, Json<UserResponse>), ApiError> {
+    // Alamat yang tidak mungkin punya akun ditolak sebelum dicatat dan sebelum Argon2.
+    let email =
+        normalize_email(&req.email, &state.auth.email_domain).map_err(|_| wrong_credentials())?;
+    let admins_only = state.auth.microsoft_full();
     if let Err(secs) = state.limiter.try_reserve(&email) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -395,7 +541,7 @@ pub async fn login(
         .db
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT id, email, name, department, role, status, password_hash FROM users WHERE email = ?1",
+                "SELECT id, email, name, departments, role, status, password_hash FROM users_with_access WHERE email = ?1",
                 params![lookup],
                 |r| {
                     Ok((
@@ -403,7 +549,7 @@ pub async fn login(
                             id: r.get(0)?,
                             email: r.get(1)?,
                             name: r.get(2)?,
-                            department: r.get(3)?,
+                            departments: crate::access::from_row(r, 3)?,
                             role: Role::parse(&r.get::<_, String>(4)?).unwrap_or(Role::User),
                         },
                         r.get::<_, String>(5)?,
@@ -417,10 +563,19 @@ pub async fn login(
 
     let hash = row
         .as_ref()
+        .filter(|(user, _, hash)| !hash.is_empty() && (!admins_only || user.role == Role::Admin))
         .map(|(_, _, h)| h.clone())
         .unwrap_or_else(|| dummy_hash().to_string());
-    let ok = verify_blocking(req.password, hash).await;
-    let Some((user, status, verified_hash)) = row.filter(|_| ok) else {
+    let ok = match verify_blocking(req.password, hash).await {
+        Ok(ok) => ok,
+        Err(busy) => {
+            state.limiter.refund(&email);
+            return Err(busy);
+        }
+    };
+    let Some((user, status, verified_hash)) = row.filter(|(user, _, hash)| {
+        ok && !hash.is_empty() && (!admins_only || user.role == Role::Admin)
+    }) else {
         return Err(wrong_credentials());
     };
     state.limiter.success(&email);
@@ -445,7 +600,10 @@ pub async fn login(
         // Password atau status berubah selagi diverifikasi.
         return Err(wrong_credentials());
     };
-    Ok((jar.add(session_cookie(token, &state)), Json(user)))
+    Ok((
+        jar.add(session_cookie(token, &state)),
+        Json(UserResponse::new(user, &state)),
+    ))
 }
 
 fn wrong_credentials() -> ApiError {
@@ -473,8 +631,33 @@ pub async fn logout(
     ))
 }
 
-pub async fn me(user: AuthUser) -> Json<AuthUser> {
-    Json(user)
+#[derive(Serialize)]
+pub struct UserResponse {
+    #[serde(flatten)]
+    user: AuthUser,
+    department: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    microsoft_secret_days: Option<i64>,
+}
+
+impl UserResponse {
+    fn new(user: AuthUser, state: &AppState) -> Self {
+        let microsoft_secret_days = state
+            .auth
+            .microsoft
+            .as_ref()
+            .filter(|m| m.enabled && user.role == Role::Admin)
+            .and_then(|m| m.expiry_warning(time::OffsetDateTime::now_utc().date()));
+        Self {
+            department: user.departments.first().cloned(),
+            user,
+            microsoft_secret_days,
+        }
+    }
+}
+
+pub async fn me(State(state): State<Arc<AppState>>, user: AuthUser) -> Json<UserResponse> {
+    Json(UserResponse::new(user, &state))
 }
 
 #[derive(Deserialize)]
@@ -501,7 +684,7 @@ pub async fn change_password(
             )?)
         })
         .await?;
-    if !verify_blocking(req.current, current_hash.clone()).await {
+    if !verify_blocking(req.current, current_hash.clone()).await? {
         return Err(ApiError::bad_request("Password lama salah."));
     }
     let new_hash = hash_blocking(req.new).await?;
@@ -658,6 +841,10 @@ mod tests {
         ] {
             assert!(normalize_email(bad, d).is_err(), "{bad} seharusnya ditolak");
         }
+        let host = "@example.com";
+        let longest = "a".repeat(MAX_EMAIL - host.len());
+        assert!(normalize_email(&format!("{longest}{host}"), d).is_ok());
+        assert!(normalize_email(&format!("{longest}a{host}"), d).is_err());
     }
 
     #[test]
@@ -731,5 +918,47 @@ mod tests {
         );
         l.success("a@example.com");
         assert!(l.try_reserve("a@example.com").is_ok());
+    }
+
+    #[test]
+    fn limiter_forgets_old_emails_and_stays_bounded() {
+        let l = LoginLimiter::default();
+        {
+            let mut map = l.attempts.lock().unwrap();
+            map.insert("lama@example.com".into(), (MAX_FAILURES, now() - LOCK_SECS));
+            map.insert(
+                "terkunci@example.com".into(),
+                (MAX_FAILURES, now() - LOCK_SECS + 30),
+            );
+            map.insert("tertua@example.com".into(), (1, now() - LOCK_SECS + 60));
+            for n in 2..MAX_TRACKED {
+                map.insert(format!("u{n}@example.com"), (1, now()));
+            }
+        }
+        assert!(l.try_reserve("baru@example.com").is_ok());
+        let map = l.attempts.lock().unwrap();
+        assert_eq!(map.len(), MAX_TRACKED);
+        assert!(!map.contains_key("lama@example.com"), "sudah lewat masanya");
+        assert!(!map.contains_key("tertua@example.com"), "dikeluarkan");
+        assert!(
+            map.contains_key("terkunci@example.com"),
+            "kunci tidak lepas karena banjir email"
+        );
+        drop(map);
+        l.refund("baru@example.com");
+        assert_eq!(l.attempts.lock().unwrap()["baru@example.com"].0, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_argon_answers_503_instead_of_piling_up() {
+        static SLOTS: Semaphore = Semaphore::const_new(1);
+        let held = SLOTS.acquire().await.unwrap();
+        let busy = argon(&SLOTS, || ()).await.err().unwrap();
+        assert_eq!(
+            axum::response::IntoResponse::into_response(busy).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(held);
+        assert_eq!(argon(&SLOTS, || 7).await.ok(), Some(7));
     }
 }

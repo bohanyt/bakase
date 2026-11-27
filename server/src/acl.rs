@@ -33,7 +33,7 @@ pub struct AuthUser {
     pub id: i64,
     pub email: String,
     pub name: String,
-    pub department: Option<String>,
+    pub departments: Vec<String>,
     pub role: Role,
 }
 
@@ -58,10 +58,9 @@ pub fn can_read(user: &AuthUser, label: Option<&Visibility>) -> bool {
     match label {
         None | Some(Visibility::Admin) => false,
         Some(Visibility::Umum) => true,
-        Some(Visibility::Departemen(allowed)) => user.department.as_deref().is_some_and(|d| {
-            allowed
-                .iter()
-                .any(|a| a.trim().eq_ignore_ascii_case(d.trim()))
+        Some(Visibility::Departemen(allowed)) => user.departments.iter().any(|d| {
+            let d = d.trim();
+            !d.is_empty() && allowed.iter().any(|a| a.trim().eq_ignore_ascii_case(d))
         }),
     }
 }
@@ -70,12 +69,12 @@ pub fn can_read(user: &AuthUser, label: Option<&Visibility>) -> bool {
 mod tests {
     use super::*;
 
-    fn user(department: Option<&str>, role: Role) -> AuthUser {
+    fn user(departments: &[&str], role: Role) -> AuthUser {
         AuthUser {
             id: 1,
             email: "a@example.com".into(),
             name: "A".into(),
-            department: department.map(Into::into),
+            departments: departments.iter().map(|d| d.to_string()).collect(),
             role,
         }
     }
@@ -86,10 +85,13 @@ mod tests {
 
     #[test]
     fn rules() {
-        let review = user(Some("Review"), Role::User);
-        let operasional = user(Some("Operasional"), Role::User);
-        let tanpa_dept = user(None, Role::User);
-        let admin = user(None, Role::Admin);
+        let review = user(&["Review"], Role::User);
+        let operasional = user(&["Operasional"], Role::User);
+        let tanpa_dept = user(&[], Role::User);
+        let admin = user(&[], Role::Admin);
+
+        let ganda = user(&["Review", "Operasional"], Role::User);
+        let umum = user(&["Umum"], Role::User);
 
         let cases: &[(&AuthUser, Option<Visibility>, bool)] = &[
             (&review, Some(Visibility::Umum), true),
@@ -99,10 +101,25 @@ mod tests {
             (&operasional, Some(dept(&["Review"])), false),
             (&operasional, Some(dept(&["Review", "Operasional"])), true),
             (&tanpa_dept, Some(dept(&["Review"])), false),
+            (&ganda, Some(Visibility::Umum), true),
+            (&ganda, Some(dept(&["review"])), true),
+            (&ganda, Some(dept(&["Operasional"])), true),
+            (&ganda, Some(dept(&["Keuangan", "Operasional"])), true),
+            (&ganda, Some(dept(&["Keuangan"])), false),
+            (&ganda, Some(dept(&[])), false),
+            (&ganda, Some(Visibility::Admin), false),
+            (&ganda, None, false),
+            (&tanpa_dept, Some(dept(&["Umum"])), false),
+            (&tanpa_dept, Some(Visibility::Admin), false),
+            (&tanpa_dept, None, false),
+            (&umum, Some(dept(&["Umum"])), true),
+            (&umum, Some(dept(&["Review"])), false),
             (&review, Some(dept(&[])), false),
             (&review, Some(Visibility::Admin), false),
             (&review, None, false),
             (&admin, None, true),
+            (&admin, Some(Visibility::Umum), true),
+            (&admin, Some(dept(&[])), true),
             (&admin, Some(Visibility::Admin), true),
             (&admin, Some(dept(&["Review"])), true),
         ];
@@ -111,7 +128,7 @@ mod tests {
                 can_read(u, label.as_ref()),
                 *expected,
                 "user {:?}/{:?}, label {:?}",
-                u.department,
+                u.departments,
                 u.role,
                 label
             );

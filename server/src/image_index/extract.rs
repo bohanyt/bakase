@@ -86,7 +86,7 @@ fn small(width: u32, height: u32) -> bool {
     width.min(height) < MIN_SIDE || u64::from(width) * u64::from(height) < MIN_AREA
 }
 
-pub(super) fn allowed_size(width: u32, height: u32) -> bool {
+pub(crate) fn allowed_size(width: u32, height: u32) -> bool {
     width.min(height) > 0
         && width.max(height) <= MAX_SIDE
         && u64::from(width) * u64::from(height) <= MAX_PIXELS
@@ -364,7 +364,7 @@ fn pdf(file: impl Read, counts: &mut Counts, emit: &mut Accept<'_>) -> Result<()
     Ok(())
 }
 
-fn safe_pdf_image(handle: &PdfImageHandle<'_>) -> bool {
+pub(crate) fn safe_pdf_image(handle: &PdfImageHandle<'_>) -> bool {
     if !allowed_size(handle.width, handle.height)
         || handle.byte_size_compressed > MAX_IMAGE_BYTES
         || handle.filter_chain.iter().any(|filter| match filter {
@@ -379,17 +379,37 @@ fn safe_pdf_image(handle: &PdfImageHandle<'_>) -> bool {
     }
     if handle.filter_chain.contains(&PdfFilter::DCTDecode) {
         // Header JPEG dapat berbeda dari dimensi yang ditulis di kamus PDF.
-        return handle.raw_compressed_bytes().is_ok_and(|bytes| {
-            ImageReader::with_format(Cursor::new(bytes), ImageFormat::Jpeg)
-                .into_dimensions()
-                .is_ok_and(|(width, height)| allowed_size(width, height))
-        });
+        return handle
+            .raw_compressed_bytes()
+            .ok()
+            .and_then(|bytes| jpeg_stream(&handle.filter_chain, bytes))
+            .is_some_and(|jpeg| {
+                ImageReader::with_format(Cursor::new(jpeg), ImageFormat::Jpeg)
+                    .into_dimensions()
+                    .is_ok_and(|(width, height)| allowed_size(width, height))
+            });
     }
     true
 }
 
+/// Byte JPEG, juga di balik Flate seperti yang ditulis sebagian scanner. Rantai lain tidak dibaca.
+fn jpeg_stream(chain: &[PdfFilter], bytes: Vec<u8>) -> Option<Vec<u8>> {
+    match chain {
+        [PdfFilter::DCTDecode] => Some(bytes),
+        [PdfFilter::FlateDecode, PdfFilter::DCTDecode] => {
+            let mut jpeg = Vec::new();
+            flate2::read::ZlibDecoder::new(bytes.as_slice())
+                .take(MAX_IMAGE_BYTES + 1)
+                .read_to_end(&mut jpeg)
+                .ok()?;
+            (jpeg.len() as u64 <= MAX_IMAGE_BYTES).then_some(jpeg)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
 
@@ -501,6 +521,38 @@ mod tests {
         }
     }
 
+    fn deflate(bytes: &[u8]) -> Vec<u8> {
+        let mut out = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        out.write_all(bytes).unwrap();
+        out.finish().unwrap()
+    }
+
+    #[test]
+    fn jpeg_behind_flate_is_checked_by_its_own_header() {
+        const CHAIN: &str = "[/FlateDecode /DCTDecode]";
+        let safe = |pdf: Vec<u8>| {
+            let doc = PdfDocument::from_bytes(pdf).unwrap();
+            let handles = doc.page_image_handles(0).unwrap();
+            assert_eq!(handles.len(), 1);
+            safe_pdf_image(&handles[0])
+        };
+        let mut jpeg = cmyk_jpeg();
+        assert!(safe(pdf_with_image(128, 128, CHAIN, &deflate(&jpeg))));
+        // Dimensi asli di header tetap menentukan, walau kamus PDF menulis ukuran kecil.
+        let sof = jpeg
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xc0])
+            .unwrap();
+        jpeg[sof + 5..sof + 9].copy_from_slice(&[0x23, 0x28, 0x23, 0x28]);
+        assert!(!safe(pdf_with_image(128, 128, CHAIN, &deflate(&jpeg))));
+        // Data yang mengembang melewati batas, bukan Flate, dan rantai lain ditolak.
+        let bomb = vec![0; MAX_IMAGE_BYTES as usize + 1];
+        assert!(!safe(pdf_with_image(128, 128, CHAIN, &deflate(&bomb))));
+        assert!(!safe(pdf_with_image(128, 128, CHAIN, &cmyk_jpeg())));
+        let chain = [PdfFilter::DCTDecode, PdfFilter::FlateDecode];
+        assert!(jpeg_stream(&chain, cmyk_jpeg()).is_none());
+    }
+
     #[test]
     fn pdf_extracts_cmyk_jpeg_but_never_decodes_or_renders_jpx() {
         let jpeg = cmyk_jpeg();
@@ -560,14 +612,19 @@ mod tests {
         jpeg
     }
 
-    fn pdf_with_image(width: u32, height: u32, filter: &str, jpeg: &[u8]) -> Vec<u8> {
+    pub(crate) fn pdf_with_image(width: u32, height: u32, filter: &str, jpeg: &[u8]) -> Vec<u8> {
         let content = "q 480 0 0 480 0 0 cm /Foto Do Q";
+        let filter = if filter.starts_with('[') {
+            filter.to_owned()
+        } else {
+            format!("/{filter}")
+        };
         let objects = [
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /XObject << /Foto 5 0 R >> >> >>".to_vec(),
             format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()).into_bytes(),
-            [format!("<< /Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Filter /{filter} /Length {} >>\nstream\n", jpeg.len()).as_bytes(), jpeg, b"\nendstream"].concat(),
+            [format!("<< /Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Filter {filter} /Length {} >>\nstream\n", jpeg.len()).as_bytes(), jpeg, b"\nendstream"].concat(),
         ];
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();

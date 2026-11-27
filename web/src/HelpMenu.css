@@ -1,0 +1,230 @@
+.help-trigger:has(+ .help-menu:popover-open) {
+  background: var(--hover);
+  color: var(--fg);
+}
+
+.help-menu,
+.extension-dialog {
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--fg);
+  box-shadow: var(--shadow);
+}
+
+.help-menu {
+  position: fixed;
+  inset: 48px max(12px, env(safe-area-inset-right, 0px)) auto auto;
+  width: min(270px, calc(100% - 24px));
+  margin: 0;
+  padding: 6px;
+  border-radius: 12px;
+}
+
+.help-menu :is(a, button) {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border-radius: 8px;
+  text-align: left;
+  text-decoration: none;
+  color: inherit;
+}
+
+.help-menu :is(a, button):hover {
+  background: var(--hover);
+}
+
+.help-menu svg {
+  flex: none;
+  color: var(--muted);
+}
+
+.help-menu svg.help-whatsapp {
+  color: var(--ok);
+}
+
+.help-menu small {
+  display: block;
+  color: var(--muted);
+  font-size: .85rem;
+}
+
+.help-menu hr {
+  margin: 5px 4px;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.extension-dialog {
+  width: min(940px, calc(100% - 24px));
+  max-height: calc(100% - 24px);
+  border-radius: 14px;
+  padding: 16px 22px;
+  line-height: 1.5;
+}
+
+.extension-dialog::backdrop {
+  background: rgb(0 0 0 / .45);
+}
+
+.extension-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.extension-dialog-head h2 {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.extension-dialog p {
+  margin: 0 0 12px;
+  color: var(--muted);
+}
+
+.extension-dialog ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: extension-step;
+}
+
+.extension-dialog li {
+  display: grid;
+  grid-template-columns: 26px 1fr;
+  padding: 9px 8px;
+  border-top: 1px solid var(--line);
+  counter-increment: extension-step;
+}
+
+.extension-dialog li.on {
+  border-radius: 9px;
+  background: var(--bubble);
+}
+
+.extension-dialog li.on code {
+  background: var(--bg);
+}
+
+.extension-dialog li::before {
+  content: counter(extension-step);
+  color: var(--muted);
+}
+
+.extension-dialog code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--bubble);
+  font: inherit;
+  white-space: nowrap;
+}
+
+.extension-download {
+  display: inline-block;
+  margin-top: 7px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  text-decoration: none;
+  font-size: .93rem;
+  font-weight: 600;
+  background: var(--send-bg);
+  color: var(--send-fg);
+}
+
+.extension-copy {
+  margin-left: 6px;
+  color: var(--muted);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.extension-copy-status {
+  display: block;
+  color: var(--muted);
+  font-size: .85rem;
+}
+
+.search-tabs.extension-tabs {
+  padding: 0 0 12px;
+}
+
+.extension-guide {
+  display: grid;
+  grid-template-columns: 310px 1fr;
+  gap: 22px;
+  align-items: start;
+}
+
+.extension-video {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #171717;
+}
+
+.extension-video video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1400 / 963;
+}
+
+.extension-video button {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  padding: 5px 14px;
+  border-radius: 999px;
+  background: #fff;
+  color: #0d0d0d;
+  font-size: .9rem;
+  font-weight: 600;
+}
+
+.extension-dialog .extension-none {
+  padding: 20px 8px;
+  border-top: 1px solid var(--line);
+}
+
+@media (max-width: 800px) {
+  .extension-guide {
+    grid-template-columns: 1fr;
+  }
+}
+
+.extension-dialog-foot {
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+  font-size: .87rem;
+}
+
+.extension-dialog-foot p {
+  margin: 0;
+}
+
+.extension-dialog-foot p + p {
+  margin-top: 5px;
+}
+
+.extension-update {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--side);
+  font-size: .87rem;
+  color: var(--muted);
+}
+
+.extension-update .icon-btn {
+  margin-left: auto;
+}

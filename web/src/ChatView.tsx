@@ -3,6 +3,7 @@ import {
   AssistantRuntimeProvider,
   AuiIf,
   ComposerPrimitive,
+  ErrorPrimitive,
   MessagePrimitive,
   ThreadPrimitive,
   useAui,
@@ -39,9 +40,11 @@ import { Mascot } from "./Mascot";
 import { workingMascotState } from "./mascotState";
 import { FileIcon } from "./FileIcon";
 import { PageButton } from "./PageButton";
-import { formatSize, kindLabel, mergeThreadMessages, serverMessageId, type AnswerMeta, type ConversationDetail, type ConversationSummary, type SourceRef } from "./messages";
+import { PageThumbnail } from "./PageThumbnail";
+import { formatSize, kindLabel, mergeThreadMessages, reloadThreadMessages, serverMessageId, thumbnailSource, type AnswerMeta, type ConversationDetail, type ConversationSummary, type SourceRef } from "./messages";
 import { PreviewContext } from "./previewContext";
 import { SourceCards, SourceChip } from "./SourceChip";
+import { ScanNotice } from "./ScanNotice";
 import { ImageGallery } from "./ImageGallery";
 import { formatMessage, lengthError, type Quote } from "./quote";
 import { QuoteChips, UserText } from "./Quotes";
@@ -170,7 +173,7 @@ function WorkingTime() {
       </div>
     );
   }
-  if (custom?.durationMs) {
+  if (custom?.durationMs && !custom.partial) {
     return <div className="worked">Selesai dalam {formatSeconds(custom.durationMs)}</div>;
   }
   return null;
@@ -271,20 +274,65 @@ function FileCards() {
   );
 }
 
+/** Diisi ChatView; `null` selama percakapan belum punya ID. */
+type ReloadAnswer = { asked: (clientId: string) => boolean; reload: () => Promise<boolean> };
+const ReloadAnswerContext = createContext<ReloadAnswer | null>(null);
+
+function AnswerError() {
+  const reloadAnswer = useContext(ReloadAnswerContext);
+  const saved = useServerId() !== undefined;
+  const parentId = useAuiState((s) => s.message.parentId);
+  const [status, setStatus] = useState<"loading" | "missing" | "failed" | null>(null);
+  // Hanya kalau server sudah menerima pertanyaannya dan jawabannya belum sampai lengkap ke sini.
+  const canReload = reloadAnswer !== null && !saved && parentId !== null && reloadAnswer.asked(parentId);
+
+  async function reload() {
+    if (!reloadAnswer) return;
+    setStatus("loading");
+    try {
+      setStatus((await reloadAnswer.reload()) ? null : "missing");
+    } catch {
+      setStatus("failed");
+    }
+  }
+
+  return (
+    <div className="msg-error" role="alert">
+      <Mascot className="working-mascot" asset="kaget" />
+      <div>
+        <ErrorPrimitive.Message />
+        {canReload && (
+          <p className="msg-error-more">
+            <button type="button" className="link" disabled={status === "loading"} onClick={() => void reload()}>
+              Muat ulang jawaban
+            </button>
+            {status === "missing" && " Belum ada jawaban yang tersimpan."}
+            {status === "failed" && " Gagal memuat. Coba lagi sebentar lagi."}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function AssistantMessage() {
   const serverId = useServerId();
+  const partial = useAuiState((s) => (s.message.metadata?.custom as AnswerMeta | undefined)?.partial);
+  const sources = useAuiState((s) => (s.message.metadata?.custom as AnswerMeta | undefined)?.sources);
+  const open = useContext(PreviewContext);
+  const thumbnail = thumbnailSource(sources);
   return (
     <MessagePrimitive.Root className="row row-assistant" data-server-id={serverId}>
       <WorkingTime />
       <Steps />
+      {thumbnail && <PageThumbnail key={`${thumbnail.doc_id}:${thumbnail.page}`} source={thumbnail} onOpen={(source) => open({ type: "source", source })} />}
       <MessagePrimitive.Parts components={{ Text: MarkdownText, Reasoning }} />
+      {sources && <ScanNotice sources={sources} />}
       <AnswerImages />
       <FileCards />
+      {partial && <p className="answer-note">Jawaban ini berhenti sebelum selesai.</p>}
       <MessagePrimitive.Error>
-        <p className="msg-error">
-          <Mascot className="working-mascot" asset="kaget" />
-          Gagal mendapat jawaban. Coba kirim ulang.
-        </p>
+        <AnswerError />
       </MessagePrimitive.Error>
       <ActionBarPrimitive.Root hideWhenRunning autohide="never" className="actions-bar">
         <ActionBarPrimitive.Copy className="icon-btn" aria-label="Salin jawaban">
@@ -506,6 +554,7 @@ export function ChatView({
   // Adapter dibuat sekali per percakapan. ID percakapan yang baru dibuat langsung
   // dipakai pesan berikutnya tanpa memasang ulang runtime (yang akan memutus
   // jawaban yang sedang mengalir). `onConversation` dan `onDone` harus stabil.
+  const [activeId, setActiveId] = useState(conversationId);
   const [summary, setSummary] = useState(initialSummary);
   const [questionIds, setQuestionIds] = useState(() => new Map<string, number>());
   const [adapter] = useState(() => {
@@ -514,6 +563,7 @@ export function ChatView({
       getConversationId: () => id,
       onConversation: (newId, title) => {
         id = newId;
+        setActiveId(newId);
         onConversation(newId, title);
       },
       onSummary: setSummary,
@@ -547,6 +597,19 @@ export function ChatView({
       unsubscribe();
     };
   }, [runtime, conversationId, boundary, questionIds]);
+  const reloadAnswer = useMemo<ReloadAnswer | null>(() => activeId === null ? null : {
+    asked: (clientId) => questionIds.has(clientId),
+    reload: async () => {
+      const detail = await api<ConversationDetail>(`/api/conversations/${encodeURIComponent(activeId)}`);
+      const current = runtime.thread.getState();
+      if (current.isRunning) throw new Error("Jawaban lain masih berjalan.");
+      const messages = reloadThreadMessages(detail.messages, current.messages, questionIds);
+      if (messages === null) return false;
+      runtime.thread.reset(messages);
+      setSummary(detail.summary);
+      return true;
+    },
+  }, [activeId, questionIds, runtime]);
   // Satu draf lampiran untuk kedua kotak tanya (sambutan dan bawah percakapan).
   const draft = useAttachmentDraft();
   const composer = runtime.thread.composer;
@@ -561,6 +624,7 @@ export function ChatView({
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
+      <ReloadAnswerContext.Provider value={reloadAnswer}>
       {conversationId === null && <FollowUpFromLogin />}
       <ThreadPrimitive.Root className="thread">
         <AuiIf condition={(s) => s.thread.isEmpty}>
@@ -597,6 +661,7 @@ export function ChatView({
           </ThreadPrimitive.Viewport>
         </AuiIf>
       </ThreadPrimitive.Root>
+      </ReloadAnswerContext.Provider>
     </AssistantRuntimeProvider>
   );
 }

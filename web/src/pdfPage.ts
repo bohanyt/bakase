@@ -48,6 +48,26 @@ export async function openPdf(url: string, controller: AbortController, fail: ()
   return getDocument(options);
 }
 
+/** Satu halaman sebagai gambar kecil, tanpa lapisan teks. */
+export async function drawPdfThumbnail(url: string, number: number, canvas: HTMLCanvasElement, controller: AbortController) {
+  const { signal } = controller;
+  const task = await openPdf(url, controller, () => controller.abort());
+  const stop = () => void task.destroy().catch(() => {});
+  signal.addEventListener("abort", stop);
+  try {
+    const page = await (await task.promise).getPage(number);
+    // Lebarnya nol kalau kolom menyempit selama halaman dimuat.
+    const width = (canvas.clientWidth || 340) * Math.min(window.devicePixelRatio || 1, 2);
+    const viewport = page.getViewport({ scale: width / page.getViewport({ scale: 1 }).width });
+    canvas.width = Math.max(1, Math.floor(viewport.width));
+    canvas.height = Math.max(1, Math.floor(viewport.height));
+    await page.render({ canvas, viewport, annotationMode: AnnotationMode.DISABLE }).promise;
+  } finally {
+    signal.removeEventListener("abort", stop);
+    stop();
+  }
+}
+
 export function drawPdfPage(page: PDFPageProxy, viewport: ReturnType<PDFPageProxy["getViewport"]>, canvas: HTMLCanvasElement, container: HTMLDivElement) {
   const density = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(8_000_000 / (viewport.width * viewport.height)));
   canvas.width = Math.max(1, Math.floor(viewport.width * density));

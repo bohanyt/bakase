@@ -16,6 +16,7 @@ use std::{
     collections::{HashMap, HashSet},
 };
 use tantivy::collector::{Count, DocSetCollector, TopDocs};
+#[cfg(not(windows))]
 use tantivy::directory::MmapDirectory;
 use tantivy::query::{
     AllQuery, Bm25StatisticsProvider, BooleanQuery, EnableScoring, Occur, Query, QueryParser,
@@ -33,6 +34,11 @@ use tantivy::{
     DocAddress, DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TERMINATED,
     TantivyDocument, Term,
 };
+
+#[cfg(windows)]
+mod windows_directory;
+#[cfg(windows)]
+use windows_directory::MmapDirectory;
 
 /// Saat skema Tantivy berubah, perbarui juga tabel status, pembaca skema, dan fallback.
 pub const INDEX_VERSION: i64 = 4;
@@ -223,14 +229,13 @@ fn readable_labels(user: &AuthUser) -> Option<Vec<String>> {
         return None;
     }
     let mut labels = vec!["umum".to_string()];
-    if let Some(d) = user
-        .department
-        .as_deref()
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-    {
-        labels.push(format!("dept:{}", d.to_ascii_lowercase()));
-    }
+    labels.extend(
+        user.departments
+            .iter()
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty())
+            .map(|d| format!("dept:{}", d.to_ascii_lowercase())),
+    );
     Some(labels)
 }
 
@@ -367,6 +372,14 @@ impl Bm25StatisticsProvider for VisibleStats<'_> {
     }
 }
 
+/// Sisa file sementara index dari proses yang mati. Hanya dipanggil pemegang lock penulis.
+pub(crate) fn remove_stale_temps(dir: &Path) {
+    #[cfg(windows)]
+    windows_directory::remove_stale_temps(dir);
+    #[cfg(not(windows))]
+    let _ = dir;
+}
+
 pub struct DocIndex {
     index: Index,
     reader: IndexReader,
@@ -435,18 +448,27 @@ impl DocIndex {
     }
 
     pub fn open_current(dir: &Path, create: bool) -> Result<Self> {
+        Self::open_current_with_policy(dir, create, ReloadPolicy::OnCommitWithDelay)
+    }
+
+    pub(crate) fn open_for_ingest(dir: &Path, create: bool) -> Result<Self> {
+        // Ingest only reads OCR from the snapshot taken before it writes.
+        Self::open_current_with_policy(dir, create, ReloadPolicy::Manual)
+    }
+
+    fn open_current_with_policy(dir: &Path, create: bool, policy: ReloadPolicy) -> Result<Self> {
         let (schema, fields) = schema_v4();
         let index = if create {
             fs::create_dir_all(dir)?;
             Index::open_or_create(MmapDirectory::open(dir)?, schema.clone())?
         } else {
-            Index::open_in_dir(dir)?
+            Index::open(MmapDirectory::open(dir)?)?
         };
         anyhow::ensure!(
             index.schema() == schema,
             "skema index v{INDEX_VERSION} tidak cocok"
         );
-        let mut index = Self::from_index(index, fields)?;
+        let mut index = Self::from_index_with_policy(index, fields, policy)?;
         index.table = INDEX_TABLE;
         Ok(index)
     }
@@ -482,11 +504,12 @@ impl DocIndex {
     }
 
     fn from_index(index: Index, fields: Fields) -> Result<Self> {
+        Self::from_index_with_policy(index, fields, ReloadPolicy::OnCommitWithDelay)
+    }
+
+    fn from_index_with_policy(index: Index, fields: Fields, policy: ReloadPolicy) -> Result<Self> {
         index.tokenizers().register(TOKENIZER, analyzer());
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()?;
+        let reader = index.reader_builder().reload_policy(policy).try_into()?;
         Ok(Self {
             index,
             reader,
@@ -1069,7 +1092,7 @@ mod tests {
             id: 1,
             email: "a@example.com".into(),
             name: "A".into(),
-            department: department.map(Into::into),
+            departments: department.map(Into::into).into_iter().collect(),
             role,
         }
     }
@@ -1388,6 +1411,7 @@ mod tests {
                 db: db.clone(),
                 user: user(Some("Review"), Role::User),
                 sources: std::sync::Arc::new(cfg.sources.clone()),
+                session: None,
             }),
         };
         let result = crate::agent::run_tool(

@@ -6,7 +6,7 @@ import type { User } from "./api";
 export type AdminTab = "users" | "feedback" | "usage";
 
 /** Tab dipegang oleh Shell, jadi tetap di Feedback setelah bolak-balik membuka chat. */
-export function AdminPage({
+export default function AdminPage({
   me,
   tab,
   onTab,
@@ -18,7 +18,7 @@ export function AdminPage({
   onOpenChat: OpenChat;
 }) {
   return (
-    <div className="page">
+    <div className={tab === "users" ? "page admin-users-page" : "page"}>
       <h2>Admin</h2>
       <div className="search-tabs admin-tabs" role="tablist">
         <button type="button" role="tab" aria-selected={tab === "users"} onClick={() => onTab("users")}>

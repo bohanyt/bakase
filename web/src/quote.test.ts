@@ -4,6 +4,7 @@ import {
   MAX_MESSAGE_CHARS,
   cleanQuoteText,
   columnName,
+  edgeScrollStep,
   formatMessage,
   lengthError,
   markdownTable,
@@ -219,4 +220,17 @@ test("U+FEFF tidak dipangkas, sama seperti str::trim di server", () => {
   const message = formatMessage([], typed);
   assert.ok(message.startsWith("\uFEFF:::kutipan"), message);
   assert.equal(parseMessage(message).quotes.length, 0);
+});
+
+test("edgeScrollStep: arah ke tepi terdekat, makin jauh lewat tepi makin cepat", () => {
+  // Area sel terlihat 100..500 piksel.
+  assert.equal(edgeScrollStep(300, 100, 500), 0);
+  assert.equal(edgeScrollStep(476, 100, 500), 0);
+  assert.ok(edgeScrollStep(490, 100, 500) > 0);
+  assert.ok(edgeScrollStep(560, 100, 500) > edgeScrollStep(500, 100, 500));
+  assert.equal(edgeScrollStep(5000, 100, 500), 24);
+  assert.ok(edgeScrollStep(110, 100, 500) < 0);
+  assert.equal(edgeScrollStep(-5000, 100, 500), -24);
+  // Area sempit: zona tepi mengecil supaya bagian tengah tetap diam.
+  assert.equal(edgeScrollStep(130, 100, 160), 0);
 });

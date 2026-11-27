@@ -310,13 +310,14 @@ fn init_file_log(dir: &Path) -> Result<()> {
         .append(true)
         .open(&path)
         .with_context(|| format!("tidak bisa menulis log {}", path.display()))?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| crate::SERVER_LOG_FILTER.into()),
+    use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_filter(crate::log_filter(crate::SERVER_LOG_FILTER)),
         )
-        .with_ansi(false)
-        .with_writer(std::sync::Mutex::new(file))
         .init();
     Ok(())
 }

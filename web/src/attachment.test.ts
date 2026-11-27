@@ -7,9 +7,11 @@ const MB = 1024 * 1024;
 test("jenis dan ukuran mengikuti batas server", () => {
   assert.equal(checkFile("Layar.PNG", 2 * MB), null);
   assert.equal(checkFile("Rekap.xlsx", 25 * MB), null);
+  assert.equal(checkFile("Rekap.xlsm", 25 * MB), null);
   assert.equal(checkFile("Rekap.xls", 25 * MB), null);
   assert.match(checkFile("Rekap.xls", 25 * MB + 1) ?? "", /25 MB/);
   assert.ok(ACCEPT.split(",").includes(".xls"));
+  assert.ok(ACCEPT.split(",").includes(".xlsm"));
   assert.match(checkFile("program.exe", 10) ?? "", /belum bisa dilampirkan/);
   assert.match(checkFile("gambar.svg", 10) ?? "", /belum bisa dilampirkan/);
   assert.match(checkFile("tanpa-ekstensi", 10) ?? "", /belum bisa dilampirkan/);
